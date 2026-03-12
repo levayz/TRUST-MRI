@@ -66,6 +66,27 @@ This places the tokenizer weights and config at `weights/meditok/`.
 
 The dataset loader expects [fastMRI](https://fastmri.org/) single-coil knee and brain data in HDF5 format (`.h5` files). Each file should contain the `kspace` key with complex-valued k-space data.
 
+### Directory Structure
+
+Create a `fastmri` folder in the project root with the following structure:
+
+```
+fastmri/
+├── knee/
+│   ├── singlecoil_train/    # Training data (.h5 files)
+│   └── singlecoil_val/      # Validation data (.h5 files)
+└── brain/                   # (optional, for brain experiments)
+    ├── singlecoil_train/
+    └── singlecoil_val/
+```
+
+Download the single-coil knee (and optionally brain) datasets from [fastmri.org](https://fastmri.org/) and place the `.h5` files in the respective folders.
+
+**Note:** For brain data, run the preprocessing script after downloading:
+```bash
+python create_esc_data.py
+```
+
 Optionally provide a `--data-split` `.txt` file listing filenames (one per line) to restrict evaluation to a specific subset.
 
 ## Training
