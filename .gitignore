@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+env/
+
+# PyTorch checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+wandb/
+
+# Data and results
+results/
+outputs/
+fastmri/
+
+# Misc
+*.pdf
+fastmri
+weights

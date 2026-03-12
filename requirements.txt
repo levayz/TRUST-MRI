@@ -1,0 +1,13 @@
+torch>=2.1.2
+torchvision>=0.16.2
+numpy==1.26.4
+pandas>=2.2.2
+timm==1.0.8
+transformers>=4.45.2
+h5py
+scikit-image
+piq
+pytz
+tqdm
+matplotlib
+Pillow
