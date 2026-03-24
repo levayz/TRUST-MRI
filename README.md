@@ -2,8 +2,7 @@
 
 This is the official code repository for the paper:
 
-> **Anatomical Token Uncertainty for Transformer-Guided Active MRI Acquisition**
-> *Anonymous Authors*
+> **[Anatomical Token Uncertainty for Transformer-Guided Active MRI Acquisition](https://arxiv.org/abs/2603.21806)**
 
 ## Overview
 
@@ -179,6 +178,17 @@ This work builds on:
 
 If you use this code, please also cite the MedITok tokenizer:
 
+```bibtex
+@misc{ayzenberg2026anatomicaltokenuncertaintytransformerguided,
+      title={Anatomical Token Uncertainty for Transformer-Guided Active MRI Acquisition}, 
+      author={Lev Ayzenberg and Shady Abu-Hussein and Raja Giryes and Hayit Greenspan},
+      year={2026},
+      eprint={2603.21806},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2603.21806}, 
+}
+```
 ```bibtex
 @article{ma2025meditok,
   title={{MedITok}: A Unified Tokenizer for Medical Image Synthesis and Interpretation},
