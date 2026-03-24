@@ -70,7 +70,11 @@ def apply_mask(data, mask_func, seed=None):
     shape = np.array(data.shape)
     shape[:-3] = 1
     mask = mask_func(shape, seed)
-    return data * mask, mask
+    # 2D masks return (1, H, W, 1); squeezing before multiply avoids adding
+    # a spurious leading batch dim via broadcasting.  The raw mask (with the
+    # leading 1) is still returned so callers can distinguish 1D vs 2D by dim.
+    mask_for_mul = mask.squeeze(0) if mask.dim() > data.dim() else mask
+    return data * mask_for_mul, mask
 
 
 # def fft2(data, normalized=True):

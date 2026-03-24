@@ -4,9 +4,8 @@ set -euo pipefail
 export PYTHONPATH="$(pwd)"
 
 # ── GPU / port ────────────────────────────────────────────────────────────────
-export CUDA_VISIBLE_DEVICES="0,1"
-MASTER_PORT=29503
-
+export CUDA_VISIBLE_DEVICES="1,2"
+MASTER_PORT=29505
 # ── Dataset: choose "knee" or "brain" ────────────────────────────────────────
 ORGAN="knee"
 
@@ -16,7 +15,7 @@ case $ORGAN in
     CUSTOM_SPLIT="none"
     VAL_DATASET="fastmri/knee/singlecoil_val"
     CUSTOM_VAL_SPLIT="fastmri/splits/adasense_test_split.txt"
-    RESULT_DIR="results/kfar_knee"
+    RESULT_DIR="results/knee"
     IMG_SIZE=320
     COND_TOKENS=400
     END_SLICE_SKIP=0
@@ -26,7 +25,7 @@ case $ORGAN in
     CUSTOM_SPLIT="fastmri/splits/multicoil_brain_train.txt"
     VAL_DATASET="fastmri/brain/singlecoil_emulated_all"
     CUSTOM_VAL_SPLIT="fastmri/splits/suno_brain_test.txt"
-    RESULT_DIR="results/kfar_brain"
+    RESULT_DIR="results/brain"
     IMG_SIZE=256
     COND_TOKENS=256
     END_SLICE_SKIP=0
@@ -35,13 +34,21 @@ esac
 
 # ── Model / training config ───────────────────────────────────────────────────
 GPT_MODEL="GPT-L"
-BATCH_SIZE=32
-CF=0.04          # center fraction of k-space always acquired
-ACC=8            # undersampling acceleration factor
+BATCH_SIZE=8
+CF=0.04          # center fraction of k-space always acquired (ignored for vds2d/poisson)
+ACC=400       # one or more acceleration factors; mask func picks randomly per sample
+MASK_TYPE="vds2d"  # 1D Cartesian: cart_1d | equispaced    2D: vds2d | poisson
+
+# Map mask type to a short display label for directory names
+case $MASK_TYPE in
+  cart_1d|equispaced) MASK_LABEL="cart_1d" ;;
+  *)                  MASK_LABEL="$MASK_TYPE" ;;
+esac
+RESULT_DIR="${RESULT_DIR}/${MASK_LABEL}"
 
 torchrun --nproc_per_node=2 --master_port=$MASTER_PORT \
   autoregressive/train/train.py \
-  --exp-name "run1_${GPT_MODEL}/cf_${CF}/acc_${ACC}" \
+  --exp-name "run1_${GPT_MODEL}/cf_${CF}/acc_${ACC// /_}" \
   --results-dir "$RESULT_DIR" \
   --dataset mri_code \
   --data-root "$DATASET" \
@@ -58,8 +65,9 @@ torchrun --nproc_per_node=2 --master_port=$MASTER_PORT \
   --vocab-size 32768 \
   --image-size "$IMG_SIZE" \
   --downsample-size 16 \
-  --center-fractions "$CF" \
-  --accelerations "$ACC" \
+  --center-fractions ${CF} \
+  --accelerations ${ACC} \
+  --mask-type "$MASK_TYPE" \
   --far-mask-mode radial \
   --complex-mode cartesian \
   --global-batch-size "$BATCH_SIZE" \

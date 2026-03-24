@@ -161,7 +161,12 @@ def save_entropy_maps(
     # Apply heatmap colormap to entropy columns (hot: dark=low entropy, bright=high entropy)
     # Use log transform for frequency entropy to handle large dynamic range
     col1_colored = torch.stack([apply_colormap(col1[i], 'hot', use_log=True) for i in range(col1.shape[0])], dim=0)
-    col2_colored = torch.stack([apply_colormap(col2[i], 'hot', use_log=False) for i in range(col2.shape[0])], dim=0)
+    # Last row of col2 is the final reconstruction — show as grayscale instead of heatmap
+    col2_colored = torch.stack(
+        [apply_colormap(col2[i], 'hot', use_log=False) for i in range(col2.shape[0] - 1)]
+        + [col2[-1].repeat(3, 1, 1)],
+        dim=0,
+    )
     
     # Convert grayscale columns to RGB (3 channels) to match colored columns
     col0 = col0.repeat(1, 3, 1, 1)
@@ -558,6 +563,36 @@ def save_pngs(out_path: Path, images_chw: list[torch.Tensor], labels: list[str] 
     img.save(out_path)
 
 
+def _build_2d_mask_func(args):
+    """Instantiate a 2D mask func (VDS or Poisson) from eval args, or return None."""
+    mask_type = getattr(args, 'initial_mask_type', 'random')
+    if mask_type not in ('vds2d', 'poisson'):
+        return None
+    # mask_initial_acceleration=None means no initial mask (zero start).
+    if getattr(args, 'mask_initial_acceleration', None) is None:
+        return None
+    acc = args.mask_initial_acceleration
+    acc_list = [int(round(acc))]
+    if mask_type == 'vds2d':
+        from data.subsample import VariableDensity2DMaskFunc
+        return VariableDensity2DMaskFunc(
+            accelerations=acc_list,
+            profile=getattr(args, 'vds_profile', 'power_law'),
+            decay=getattr(args, 'vds_decay', 2.0),
+            sigma=getattr(args, 'vds_sigma', 0.25),
+            acs_fraction=getattr(args, 'vds_acs_fraction', 0.0),
+        )
+    else:  # poisson
+        from data.subsample import PoissonDiskMaskFunc
+        return PoissonDiskMaskFunc(
+            accelerations=acc_list,
+            min_dist_frac=getattr(args, 'poisson_min_dist_frac', 0.03),
+            vds_weighting=True,
+            profile=getattr(args, 'vds_profile', 'power_law'),
+            decay=getattr(args, 'vds_decay', 2.0),
+        )
+
+
 @torch.no_grad()
 def validate(
     gpt,
@@ -608,6 +643,7 @@ def validate(
     scan_imgs = {}
     scan_gts = {}
     scan_masks = {}
+    scan_masked = {}
     
     # which func to use
     rec_fn = reconstruct_far
@@ -626,11 +662,31 @@ def validate(
         "top_k": getattr(args, 'top_k', 0)
     }
 
+    # Build 2D override mask func once (VDS or Poisson), or None for 1D Cartesian
+    override_mask_func = _build_2d_mask_func(args)
+
     pbar = tqdm(loader, "recon")
     for idx, batch in enumerate(pbar):
         gt_c_image = batch["gt_c_image"].to(device, non_blocking=True)   # [B,H,W,2],
         masked_c_image = batch["masked_c_image"].to(device, non_blocking=True)   # [B,H,W,2]
         sample_mask = batch["mask"].to(device, non_blocking=True)
+
+        # Override the dataset's 1D Cartesian mask with a 2D VDS/Poisson mask
+        if getattr(args, 'initial_mask_type', 'random') in ('vds2d', 'poisson'):
+            B, H, W, _ = gt_c_image.shape
+            if override_mask_func is not None:
+                masks = []
+                for b_i in range(B):
+                    m = override_mask_func((1, H, W, 2))  # [1, H, W, 1]
+                    m = m.squeeze(0).expand(H, W, 2).to(device).contiguous()  # [H, W, 2]
+                    masks.append(m)
+                sample_mask = torch.stack(masks, dim=0)  # [B, H, W, 2]
+            else:
+                # --vds-no-initial-mask: start from zero measurements
+                sample_mask = torch.zeros_like(gt_c_image)
+            masked_c_image = data_consistency(
+                gt_c_image, torch.zeros_like(gt_c_image), sample_mask
+            )
 
         max_val = batch.get("max_val", None)
         fname = batch.get("fname", None)
@@ -654,6 +710,8 @@ def validate(
             les_zero_mean=getattr(args, 'les_zero_mean', False),
             les_radial_weight_alpha=getattr(args, 'les_radial_weight_alpha', 0.0),
             center_fractions=getattr(args, 'center_fractions', 0.04),
+            active_sampling_mask_type=getattr(args, 'active_sampling_mask_type', 'cartesian'),
+            poisson_active_min_dist=getattr(args, 'poisson_active_min_dist', 4.0),
         )  # [B,H,W,2]
         gen_prog = aux.get("gen_progress", None)
         sample_mask = aux.get("sample_mask", sample_mask)
@@ -704,24 +762,11 @@ def validate(
 
         # save
         B = rec.shape[0]
+        masked_in_np = masked_in.detach().cpu().float().numpy()
         for i in range(B):
-            if n_imgs_to_save > 0:
-                name = save_slice_viz(
-                    args=args,
-                    out_dir=out_dir,
-                    i=i,
-                    fname=fname,
-                    slice_idx=slice_idx,
-                    rec_vis=rec_vis,
-                    gt_vis=gt_vis,
-                    masked_in_vis=masked_in_vis,
-                    sample_mask=sample_mask,
-                    scan_buf=scan_buf,
-                    gen_prog=gen_prog,
-                    gt_c_image=gt_c_image,
-                )
-            else:
-                name = Path(fname[i]).stem if fname is not None else str(i)
+            name = Path(fname[i]).stem if fname is not None else str(i)
+            if slice_idx is not None:
+                name = f"{name}_slice{int(slice_idx[i])}"
 
             if n_imgs_to_save > 0:
                 save_entropy_maps(
@@ -757,15 +802,44 @@ def validate(
                 scan_imgs[scan_key] = []
                 scan_gts[scan_key] = []
                 scan_masks[scan_key] = []
+                scan_masked[scan_key] = []
+            sl = int(slice_idx[i]) if slice_idx is not None else len(scan_buf[scan_key]["slice"])
             scan_buf[scan_key]["rec"].append(rec_np[i])
             scan_buf[scan_key]["gt"].append(gt_np[i])
-            scan_buf[scan_key]["slice"].append(int(slice_idx[i]) if slice_idx is not None else len(scan_buf[scan_key]["slice"]))
-            scan_imgs[scan_key].append((int(slice_idx[i]) if slice_idx is not None else len(scan_imgs[scan_key]), rec_np[i]))
-            scan_gts[scan_key].append((int(slice_idx[i]) if slice_idx is not None else len(scan_gts[scan_key]), gt_np[i]))
-            scan_masks[scan_key].append((int(slice_idx[i]) if slice_idx is not None else len(scan_masks[scan_key]), sample_mask[i].cpu().numpy()))
+            scan_buf[scan_key]["slice"].append(sl)
+            scan_imgs[scan_key].append((sl, rec_np[i]))
+            scan_gts[scan_key].append((sl, gt_np[i]))
+            scan_masks[scan_key].append((sl, sample_mask[i].cpu().numpy()))
+            scan_masked[scan_key].append((sl, masked_in_np[i]))
 
     # compute per-scan PSNR/SSIM/LPIPS/DISTS
     metrics = compute_reconstruction_metrics(scan_buf, device)
+
+    # save middle slice PNG for each of the first n_scans_to_save scans
+    n_scans_to_save = getattr(args, 'n_scans_to_save', 4)
+    if n_scans_to_save > 0:
+        os.makedirs(out_dir, exist_ok=True)
+        for scan_idx, k in enumerate(sorted(scan_imgs.keys())):
+            if scan_idx >= n_scans_to_save:
+                break
+            sorted_recs = sorted(scan_imgs[k], key=lambda p: p[0])
+            mid = len(sorted_recs) // 2
+            mid_sl, mid_rec_np = sorted_recs[mid]
+            mid_gt_np = sorted(scan_gts[k], key=lambda p: p[0])[mid][1]
+            mid_mask_np = sorted(scan_masks[k], key=lambda p: p[0])[mid][1]
+            mid_masked_np = sorted(scan_masked[k], key=lambda p: p[0])[mid][1]
+
+            gt_max = float(mid_gt_np.max()) or 1.0
+            rec_t = torch.from_numpy(mid_rec_np / gt_max).clamp(0, 1).unsqueeze(0)
+            gt_t = torch.from_numpy(mid_gt_np / gt_max).clamp(0, 1).unsqueeze(0)
+            masked_t = torch.from_numpy(mid_masked_np / gt_max).clamp(0, 1).unsqueeze(0)
+            mask_t = torch.from_numpy(mid_mask_np[..., 0]).unsqueeze(0)
+            delta_t = (rec_t - gt_t).abs()
+            delta_t = (delta_t - delta_t.min()) / (delta_t.max() - delta_t.min() + 1e-8)
+
+            out_path = out_dir / f"{k}_slice{mid_sl}.png"
+            save_pngs(out_path, [mask_t, masked_t, rec_t, gt_t, delta_t],
+                      labels=["Mask", "Masked Input", "Reconstruction", "Ground Truth", "|Rec - GT|"])
 
     # save per-scan volumes as h5 (sorted by slice)
     if save_volumes:
@@ -895,10 +969,31 @@ if __name__ == "__main__":
     parser.add_argument("--budget", type=int, default=None, help="num vertical lines to sample, if None is calculated from image size and accelerations")
     parser.add_argument("--active-sampling-rank", type=int, default=None, help="num of sampled line per active sampling iterations")
     parser.add_argument("--active-sampling-fn", type=str, default=None, choices=[None, "patch_logits", "gradient", "probe_attention"]) # TODO make consts
+    parser.add_argument("--active-sampling-mask-type", type=str, default="cartesian",
+        choices=["cartesian", "2d", "poisson"],
+        help="Active sampling selection pattern: cartesian=vertical lines, 2d=top-k 2D points, poisson=Poisson-disk-constrained 2D points")
     parser.add_argument("--les-zero-mean", action='store_true',
         help="LES: subtract spatial mean from entropy before FFT to remove DC dominance")
     parser.add_argument("--les-radial-weight-alpha", type=float, default=0.0,
         help="LES: multiply freq_magnitude by r^alpha to boost outer k-space (0=off, 1=linear, 2=quadratic)")
+    # 2D sampling pattern (VDS / Poisson disk)
+    parser.add_argument("--initial-mask-type", type=str, default="random",
+        choices=["random", "equispaced", "vds2d", "poisson"],
+        help="Initial k-space mask type. 'vds2d' and 'poisson' replace the dataset's 1D Cartesian mask.")
+    parser.add_argument("--vds-profile", type=str, default="power_law",
+        choices=["power_law", "gaussian"],
+        help="Density profile for VDS-2D and Poisson initial masks")
+    parser.add_argument("--vds-decay", type=float, default=2.0,
+        help="Power-law decay exponent for VDS density (p(r) ∝ (1+r)^{-decay})")
+    parser.add_argument("--vds-acs-fraction", type=float, default=0.0,
+        help="Side length of the hard ACS center square as a fraction of min(H,W). "
+             "E.g. 0.025 gives an 8x8 ACS on a 320x320 image. 0.0 = no hard ACS zone.")
+    parser.add_argument("--vds-sigma", type=float, default=0.25,
+        help="Gaussian sigma as fraction of r_max for VDS density (only used with --vds-profile gaussian)")
+    parser.add_argument("--poisson-min-dist-frac", type=float, default=0.03,
+        help="Poisson disk minimum inter-sample distance as fraction of min(H,W) for the initial mask")
+    parser.add_argument("--poisson-active-min-dist", type=float, default=4.0,
+        help="Poisson disk minimum distance in pixels for the active sampling step")
     parser.add_argument("--probe-model", action='store_true', help="wrap model with learnable kspace query tokens for active sampling")
     # Image processing
     parser.add_argument("--denoise", action='store_true', help='apply denoising filter to reconstruction')
@@ -911,11 +1006,43 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     if args.active_sampling:
-        args.budget = calc_budget(args.image_size, args.center_fractions, args.accelerations) if args.budget is None else args.budget
-        args.accelerations = float("inf")
-        if args.active_sampling_steps == None:
-            args.active_sampling_rank = args.budget
+        if args.initial_mask_type in ("vds2d", "poisson"):
+            H = args.image_size
+            acc = args.accelerations[0] if isinstance(args.accelerations, list) else args.accelerations
+            n_target_2d = round(H * H / acc)
+            acs_frac = getattr(args, 'vds_acs_fraction', 0.0)
+            if acs_frac > 0.0:
+                # ACS-only initial mask: the guaranteed center square, no random outer points
+                acs_half = round(H * acs_frac / 2)
+                n_initial_2d = (2 * acs_half) ** 2
+                args.mask_initial_acceleration = float(H * H) / n_initial_2d
+            else:
+                # Legacy CF-based path
+                n_initial_2d = round(H * H * args.center_fractions)
+                if n_initial_2d == 0:
+                    args.mask_initial_acceleration = None  # signals validate() to use zero mask
+                else:
+                    args.mask_initial_acceleration = 1.0 / args.center_fractions
+            args.budget = max(1, n_target_2d - n_initial_2d) if args.budget is None else args.budget
+            args.mask_accelerations = acc  # preserve scalar target acc before overwrite
+            args.accelerations = float("inf")
+            if args.active_sampling_steps is None:
+                args.active_sampling_rank = args.budget
+            else:
+                args.active_sampling_rank = max(1, int(args.budget / args.active_sampling_steps))
+                print(f"using 2D AS rank:{args.active_sampling_rank} ({args.budget} budget / {args.active_sampling_steps} steps)")
         else:
-            args.active_sampling_rank = max(1, int(args.budget / args.active_sampling_steps))
-            print(f"using AS rank:{args.active_sampling_rank}")
+            # Existing 1D Cartesian budget logic
+            args.budget = calc_budget(args.image_size, args.center_fractions, args.accelerations) if args.budget is None else args.budget
+            args.accelerations = float("inf")
+            if args.active_sampling_steps == None:
+                args.active_sampling_rank = args.budget
+            else:
+                args.active_sampling_rank = max(1, int(args.budget / args.active_sampling_steps))
+                print(f"using AS rank:{args.active_sampling_rank}")
+    elif getattr(args, 'initial_mask_type', 'random') in ("vds2d", "poisson"):
+        # Plain reconstruction: use the full target acceleration so the initial mask
+        # matches the training mask (ACS + VDS random outer points).
+        acc = args.accelerations[0] if isinstance(args.accelerations, list) else args.accelerations
+        args.mask_initial_acceleration = float(acc)
     main(args)

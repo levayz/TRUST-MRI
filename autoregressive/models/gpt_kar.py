@@ -1299,7 +1299,6 @@ def PROBE_GPT_B(resolution, backbone, backbone_checkpoint, freeze_backbone=True)
 
     return model
 
-
 KAR_GPT_models = {
     'GPT-B': KAR_GPT_B, 'GPT-L': KAR_GPT_L, 'GPT-XL': KAR_GPT_XL, 'GPT-XXL': KAR_GPT_XXL, 'GPT-XXXL': KAR_GPT_XXXL,
     'GPT-1B': KAR_GPT_1B, 'GPT-3B': KAR_GPT_3B, 'GPT-7B': KAR_GPT_7B,

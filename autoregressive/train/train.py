@@ -479,6 +479,10 @@ def main(args):
         logger.info("compiling the model... (may take several minutes)")
         model = torch.compile(model)  # requires PyTorch 2.0
 
+    # Sync before DDP: dataset scanning and checkpoint loading are asymmetric across ranks
+    # (rank 0 also builds val dataset). Without this barrier, rank 0 can enter DDP init
+    # while rank 1 is still scanning H5 files → NCCL spin-wait.
+    dist.barrier()
     model = DDP(model.to(device), device_ids=[args.gpu], find_unused_parameters=True)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
@@ -718,7 +722,7 @@ def main(args):
                         device=device,
                         logger=logger,
                         out_dir=val_eval_args.output_dir,
-                        save_visualizations=args.val_save_viz,
+                        n_imgs_to_save=args.val_n_scans_to_save if args.val_save_viz else 0,
                         save_volumes=False,
                     )
                     
@@ -819,6 +823,12 @@ if __name__ == "__main__":
     # MRI-specific
     parser.add_argument("--center-fractions", type=float, default=0.08)
     parser.add_argument("--accelerations", type=int, default=4)
+    parser.add_argument("--mask-type", type=str, default="cart_1d",
+        choices=["cart_1d", "equispaced", "vds2d", "poisson"],
+        help="Initial k-space undersampling mask type for training")
+    parser.add_argument("--vds-acs-fraction", type=float, default=0.0,
+        help="Side length of the hard ACS center square as a fraction of min(H,W) for VDS2D masks. "
+             "E.g. 0.025 gives an 8x8 ACS on a 320x320 image. 0.0 = no hard ACS zone.")
     parser.add_argument("--acquisition-type", type=str, default=None)
     parser.add_argument("--far-mask-mode", type=str, default='cartesian')
     parser.add_argument("--complex-mode", type=str, default='cartesian', choices=['cartesian', 'polar'])

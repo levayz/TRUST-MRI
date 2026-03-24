@@ -220,7 +220,10 @@ class SliceMRICodeDataset(Dataset):
             if self.mask_func:
                 seed = None if not self.use_seed else tuple(map(ord, pathlib.Path(fname).name))
                 masked_kspace, mask = transforms.apply_mask(kspace_resized, self.mask_func, seed)
-                mask = mask.repeat(self.resolution,1,1)
+                if mask.dim() == 4:   # 2D point mask [1, H, W, 1] → [H, W, 1]
+                    mask = mask.squeeze(0)
+                else:                 # 1D column mask [1, W, 1] → [H, W, 1]
+                    mask = mask.repeat(self.resolution, 1, 1)
             else:
                 masked_kspace, mask = kspace_resized, None
 
@@ -274,7 +277,11 @@ class SliceMRICodeDataset(Dataset):
             }
 
 def build_mri_code(args, **kwargs):
-    mask = create_mask_for_mask_type('random', [getattr(args, "center_fractions", 0.08)], [getattr(args, "accelerations", 4)])
+    mask_type = getattr(args, 'mask_type', 'random')
+    accs = [getattr(args, 'accelerations', 4)]
+    cf = [getattr(args, 'center_fractions', 0.08)]
+    mask = create_mask_for_mask_type(mask_type, cf, accs,
+                                     acs_fraction=getattr(args, 'vds_acs_fraction', 0.0))
     acquisition_type = getattr(args, "acquisition_type", None)
     use_seed = getattr(args, "use_seed", False)
     if acquisition_type is not None:
@@ -291,6 +298,6 @@ def build_mri_code(args, **kwargs):
         acquisition_type=acquisition_type,
         clip_percentile=getattr(args, "clip_mri", False),
         radial_weighting=getattr(args, "radial_weighting", False),
-        custom_split=getattr(args, "data_split", None),
+        custom_split=(lambda s: None if s in (None, "none", "") else s)(getattr(args, "data_split", None)),
         label_csv=getattr(args, "label_csv", None),
     )

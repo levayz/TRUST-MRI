@@ -13,7 +13,7 @@ import torchvision.utils as vutils
 from PIL import Image
 from pathlib import Path
 from autoregressive.utils.mask_utils import radial_circle_radii, radial_circle_mask
-from autoregressive.sample.adaptive_sampling import kspace_uncertainty_from_images, kspace_uncertainty_from_patch_logits, image_entropy_to_freq_entropy
+from autoregressive.sample.adaptive_sampling import kspace_uncertainty_from_images, kspace_uncertainty_from_patch_logits, image_entropy_to_freq_entropy, _select_points_poisson_constrained
 from models.meditok import MedITok
 
 
@@ -627,6 +627,8 @@ def active_sampling_patch_logits(model, tokenizer, gt_image:torch.Tensor, masked
             rank=rank,
             les_zero_mean=kwargs.get("les_zero_mean", False),
             les_radial_weight_alpha=kwargs.get("les_radial_weight_alpha", 0.0),
+            mask_type=kwargs.get("active_sampling_mask_type", "cartesian"),
+            poisson_min_dist=kwargs.get("poisson_active_min_dist", 4.0),
         )
         sample_mask = sample_mask.permute(0,2,3,1)
         sample_progress.append(samples)
@@ -796,16 +798,41 @@ def active_sampling_entropy_gradient(
             loss.backward()
             gradients = masked_kspace.grad  # [B, H, W, 2]
 
-        # 9. Select top-rank vertical lines by gradient magnitude
+        # 9. Select new k-space points by gradient magnitude
         grad_magnitude = gradients.norm(dim=-1) * (1 - sample_mask[..., 0])  # [B, H, W]
         grad_magnitudes.append(grad_magnitude.detach().clone())
-        grad_magnitude_cols = grad_magnitude.mean(dim=1)  # [B, W]
-        _, top_indices = torch.topk(grad_magnitude_cols, rank, dim=1)  # [B, rank]
 
-        new_sample_mask = torch.zeros_like(sample_mask)
-        batch_indices = torch.arange(B, device=device)[:, None]
-        new_sample_mask[batch_indices, :, top_indices, :] = 1
-        sample_mask = torch.clamp(sample_mask + new_sample_mask, 0, 1)
+        mask_type = kwargs.get("active_sampling_mask_type", "cartesian")
+
+        if mask_type in ("cartesian", "1d"):
+            grad_magnitude_cols = grad_magnitude.mean(dim=1)  # [B, W]
+            _, top_indices = torch.topk(grad_magnitude_cols, rank, dim=1)  # [B, rank]
+            new_sample_mask = torch.zeros_like(sample_mask)
+            batch_indices = torch.arange(B, device=device)[:, None]
+            new_sample_mask[batch_indices, :, top_indices, :] = 1
+            sample_mask = torch.clamp(sample_mask + new_sample_mask, 0, 1)
+
+        elif mask_type == "poisson":
+            measured = sample_mask[..., 0].unsqueeze(1).bool()  # [B, 1, H, W]
+            poisson_min_dist = kwargs.get("poisson_active_min_dist", 4.0)
+            measured = _select_points_poisson_constrained(grad_magnitude, measured, rank=rank, min_dist=poisson_min_dist)
+            sample_mask = measured.squeeze(1).float().unsqueeze(-1).expand(B, H, W, 2).clone()
+
+        else:  # "2d" — top-k individual 2D point selection
+            flat_scores = grad_magnitude.reshape(B, -1)
+            k_sel = min(rank, H * W)
+            vals, flat_idx = torch.topk(flat_scores, k=k_sel, dim=1)
+            new_sample_mask = torch.zeros_like(sample_mask)
+            valid = torch.isfinite(vals)
+            if valid.any():
+                rows = (flat_idx // W).long()
+                cols = (flat_idx % W).long()
+                bb = torch.arange(B, device=device)[:, None].expand(B, k_sel).reshape(-1)
+                rr = rows.reshape(-1)
+                cc = cols.reshape(-1)
+                vv = valid.reshape(-1)
+                new_sample_mask[bb[vv], rr[vv], cc[vv], :] = 1
+            sample_mask = torch.clamp(sample_mask + new_sample_mask, 0, 1)
         sample_masks_list.append(sample_mask.clone())
 
         masked_image = data_consistency(gt_image, torch.zeros_like(masked_image), sample_mask)

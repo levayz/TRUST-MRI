@@ -100,6 +100,68 @@ def image_entropy_to_freq_entropy(entropy_complex, zero_mean=False,
     return freq_magnitude
 
 
+def _select_points_poisson_constrained(
+    freq_magnitude: torch.Tensor,  # (B, H, W) scores, already zeroed for measured
+    measured: torch.Tensor,         # (B, 1, H, W) bool
+    rank: int,
+    min_dist: float,
+) -> torch.Tensor:
+    """Select up to `rank` 2D k-space points per batch item by descending score,
+    subject to a minimum inter-point distance constraint (Poisson disk).
+
+    Returns updated `measured` (B, 1, H, W).
+    """
+    import math
+    B, _, H, W = measured.shape
+    cell_size = max(1, math.ceil(min_dist))
+    min_dist_sq = min_dist ** 2
+
+    for b in range(B):
+        scores = freq_magnitude[b]  # (H, W)
+        flat_scores = scores.reshape(-1)
+
+        # Sort all candidates by descending score; ignore already-measured
+        sorted_idx = torch.argsort(flat_scores, descending=True)
+        meas_b = measured[b, 0]  # (H, W) bool
+
+        # Build spatial hash from already-measured points
+        grid = {}
+        meas_coords = meas_b.nonzero(as_tuple=False)  # (N_meas, 2)
+        for rc in meas_coords:
+            row, col = rc[0].item(), rc[1].item()
+            cell_key = (row // cell_size, col // cell_size)
+            grid.setdefault(cell_key, []).append((row, col))
+
+        n_accepted = 0
+        for idx in sorted_idx:
+            if n_accepted >= rank:
+                break
+            idx_item = idx.item()
+            row, col = idx_item // W, idx_item % W
+            if meas_b[row, col]:
+                continue  # already measured
+            # Check 5x5 cell neighbourhood
+            ci, cj = row // cell_size, col // cell_size
+            ok = True
+            for di in range(-2, 3):
+                for dj in range(-2, 3):
+                    for pr, pc in grid.get((ci + di, cj + dj), []):
+                        if (row - pr) ** 2 + (col - pc) ** 2 < min_dist_sq:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if ok:
+                measured[b, :, row, col] = True
+                cell_key = (ci, cj)
+                grid.setdefault(cell_key, []).append((row, col))
+                n_accepted += 1
+
+    return measured
+
+
 @torch.no_grad()
 def kspace_uncertainty_from_patch_logits(
     logits: torch.Tensor,           # (B, H_patch, W_patch, 2, K, V_per_K)
@@ -109,6 +171,8 @@ def kspace_uncertainty_from_patch_logits(
     rank: int,
     les_zero_mean: bool = False,
     les_radial_weight_alpha: float = 0.0,
+    mask_type: str = "cartesian",   # "cartesian" | "2d" | "poisson"
+    poisson_min_dist: float = 4.0,  # pixels, only used when mask_type=="poisson"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculates acquisition scores using Logit-Based Spectral Uncertainty.
@@ -187,7 +251,7 @@ def kspace_uncertainty_from_patch_logits(
     # -------------------------------------------------------------------
     # 5. Score and Select Measurements
     # -------------------------------------------------------------------
-    if vertical_mask:
+    if vertical_mask or mask_type == "cartesian":
         scores = freq_magnitude.mean(dim=-2)  # (B, W_img)
 
         measured_cols = measured.any(dim=1).any(dim=1)
@@ -208,13 +272,20 @@ def kspace_uncertainty_from_patch_logits(
 
         return measured, entropy_complex, freq_magnitude_for_display
 
-    else:
+    elif mask_type == "poisson":
+        measured = _select_points_poisson_constrained(
+            freq_magnitude,  # (B, H_img, W_img), already zeroed at measured positions
+            measured,        # (B, 1, H_img, W_img)
+            rank=rank,
+            min_dist=poisson_min_dist,
+        )
+        return measured, entropy_complex, freq_magnitude_for_display
+
+    else:  # "2d" — top-k 2D point selection
         scores_hw = freq_magnitude
 
         measured_points = measured.any(dim=1)
         scores_hw_masked = scores_hw.masked_fill(measured_points, float("-inf"))
-        B, H, W = scores_hw_masked.shape
-        scores_hw_masked_normed = F.softmax(scores_hw_masked.view(B, -1), dim=1).view(B, H, W)
 
         flat_scores = scores_hw_masked.reshape(b, -1)
         k_sel = min(rank, h_img * w_img)
