@@ -5,8 +5,8 @@ import h5py
 import pathlib
 import random
 import pandas as pd
-from data import transforms
-from data.subsample import create_mask_for_mask_type
+from dataset.data import transforms
+from dataset.data.subsample import create_mask_for_mask_type
 
 # Labels for each pathology task
 ACL_LABELS = {"Ligament - ACL High Grade Sprain", "Ligament - ACL Low Grade sprain"}

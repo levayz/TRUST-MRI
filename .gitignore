@@ -24,6 +24,9 @@ wandb/
 
 # Data and results
 results/
+results_multicoil/
+results_vcc_benchmark/
+notebooks/
 outputs/
 fastmri/
 

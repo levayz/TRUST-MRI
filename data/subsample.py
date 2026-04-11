@@ -5,13 +5,14 @@ This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
 
+import logging
 import math
 import numpy as np
 import torch
 
 
 def create_mask_for_mask_type(mask_type_str, center_fractions, accelerations, **kwargs):
-    print(f"creating mask with cf={center_fractions}, acc={accelerations}")
+    logging.getLogger(__name__).info(f"creating mask with cf={center_fractions}, acc={accelerations}")
     if mask_type_str in ('cart_1d', 'random'):
         return RandomMaskFunc(center_fractions, accelerations)
     elif mask_type_str == 'equispaced':
@@ -104,7 +105,6 @@ class RandomMaskFunc(MaskFunc):
             raise ValueError('Shape should have 3 or more dimensions')
 
         if seed is not None:
-            print(f"setting random mask seed")
             self.rng.seed(seed)
         num_cols = shape[-2]
         center_fraction, acceleration = self.choose_acceleration()

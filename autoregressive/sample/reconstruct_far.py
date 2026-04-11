@@ -574,7 +574,7 @@ def _build_2d_mask_func(args):
     acc = args.mask_initial_acceleration
     acc_list = [int(round(acc))]
     if mask_type == 'vds2d':
-        from data.subsample import VariableDensity2DMaskFunc
+        from dataset.data.subsample import VariableDensity2DMaskFunc
         return VariableDensity2DMaskFunc(
             accelerations=acc_list,
             profile=getattr(args, 'vds_profile', 'power_law'),
@@ -583,7 +583,7 @@ def _build_2d_mask_func(args):
             acs_fraction=getattr(args, 'vds_acs_fraction', 0.0),
         )
     else:  # poisson
-        from data.subsample import PoissonDiskMaskFunc
+        from dataset.data.subsample import PoissonDiskMaskFunc
         return PoissonDiskMaskFunc(
             accelerations=acc_list,
             min_dist_frac=getattr(args, 'poisson_min_dist_frac', 0.03),
@@ -677,7 +677,7 @@ def validate(
             if override_mask_func is not None:
                 masks = []
                 for b_i in range(B):
-                    m = override_mask_func((1, H, W, 2))  # [1, H, W, 1]
+                    m, _ = override_mask_func((1, H, W, 2))  # [1, H, W, 1]
                     m = m.squeeze(0).expand(H, W, 2).to(device).contiguous()  # [H, W, 2]
                     masks.append(m)
                 sample_mask = torch.stack(masks, dim=0)  # [B, H, W, 2]

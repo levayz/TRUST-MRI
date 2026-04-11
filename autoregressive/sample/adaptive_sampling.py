@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from data.transforms import fft2
+from dataset.data.transforms import fft2
 
 @torch.no_grad()
 def kspace_uncertainty_from_images(
