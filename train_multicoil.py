@@ -27,6 +27,7 @@ import inspect
 import json
 import math
 import warnings
+from collections import defaultdict
 
 # Suppress noisy checkpoint warnings from frozen MedITok encoder (called under no_grad)
 warnings.filterwarnings("ignore", message=".*use_reentrant.*", module="torch.utils.checkpoint")
@@ -55,6 +56,7 @@ from autoregressive.models.multicoil_recon import (
     decode_coil_latents,
     rss_from_coils,
 )
+from autoregressive.utils.metrics import compute_reconstruction_metrics
 from dataset.data.subsample import create_mask_for_mask_type
 from dataset.multicoil_data import build_multicoil_dataset
 from models.meditok import MedITok
@@ -203,6 +205,78 @@ def save_train_vis(meditok, out: dict, x_us: torch.Tensor, x_gt: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
+# Val-split filtering
+# ---------------------------------------------------------------------------
+
+def _filter_dataset_by_split(dataset, split_file: str):
+    """Restrict a multicoil dataset to the filenames listed in split_file.
+
+    Works with both plain SliceDataset and TokenCachedDataset (the latter has
+    the raw SliceDataset stored at .base).
+    """
+    if split_file is None:
+        return dataset
+    allowed = {
+        line.strip()
+        for line in Path(split_file).read_text().splitlines()
+        if line.strip()
+    }
+    base = dataset.base if hasattr(dataset, "base") else dataset
+    before = len(base.raw_samples)
+    base.raw_samples = [s for s in base.raw_samples if Path(s.fname).name in allowed]
+    after = len(base.raw_samples)
+    logging.getLogger(__name__).info(
+        f"val split filter: kept {after}/{before} slices from {split_file}"
+    )
+    return dataset
+
+
+# ---------------------------------------------------------------------------
+# Val visualisation
+# ---------------------------------------------------------------------------
+
+def _save_val_images(scan_buf: dict, output_dir: Path, step: int, max_scans: int = 4):
+    """Save a 4-panel [US | GT | Pred | Error] PNG for the center slice of up
+    to max_scans scans.  Written to output_dir/val_vis/{step}_{scan}.png."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    vis_dir = output_dir / "val_vis"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    for scan_idx, (fname, v) in enumerate(scan_buf.items()):
+        if scan_idx >= max_scans:
+            break
+        order = sorted(range(len(v["slice"])), key=lambda i: v["slice"][i])
+        ci = order[len(order) // 2]   # center slice index
+
+        gt_np   = v["gt"][ci]
+        pred_np = v["rec"][ci]
+        us_np   = v["us"][ci]
+        error   = np.abs(pred_np - gt_np)
+
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        for ax, img, title in zip(
+            axes,
+            [us_np, gt_np, pred_np, error],
+            ["US RSS", "GT RSS", "Pred RSS", "|Pred − GT|"],
+        ):
+            ax.imshow(img, cmap="gray", vmin=0, vmax=max(float(img.max()), 1e-6))
+            ax.set_title(title, fontsize=9)
+            ax.axis("off")
+
+        safe = Path(fname).stem
+        fig.suptitle(f"step {step}  |  {safe}", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(vis_dir / f"{step:07d}_{safe}.png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -212,6 +286,9 @@ def parse_args():
     # data
     p.add_argument("--train_path",        required=True)
     p.add_argument("--val_path",          required=True)
+    p.add_argument("--val_split_file",    default=None,
+                   help="text file with one H5 filename per line; "
+                        "restricts val set to those scans only")
     p.add_argument("--center_fraction",   type=float,  default=0.04)
     p.add_argument("--acceleration",      type=int,    default=4)
     p.add_argument("--vcc_matrix_dir",     default=None,
@@ -267,6 +344,8 @@ def parse_args():
     p.add_argument("--log_every",   type=int,   default=50)
     p.add_argument("--vis_every",   type=int,   default=2000,
                    help="save a visualisation grid every N steps (0 = disabled)")
+    p.add_argument("--val_max_images", type=int, default=4,
+                   help="max number of scan images to save per validation run")
     p.add_argument("--no_scheduler", action="store_true",
                    help="disable cosine LR scheduler; use constant LR throughout")
     p.add_argument("--resume",      default=None, help="path to checkpoint to resume from")
@@ -279,9 +358,16 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def run_validation(model, loader, lambda_coil, lambda_dc, device, logger, step, simple=False):
+def run_validation(
+    model, meditok, loader, lambda_coil, lambda_dc, device, logger, step,
+    simple=False, output_dir=None, max_vis_scans=4,
+):
     model.eval()
     total, n_ce, n_lat, n_dc, count = 0.0, 0.0, 0.0, 0.0, 0
+
+    # per-scan accumulators: fname → {"rec", "gt", "us", "slice"}
+    scan_buf = defaultdict(lambda: {"rec": [], "gt": [], "us": [], "slice": []})
+
     for batch in loader:
         x_us      = batch["x_us"].to(device)
         x_gt      = batch["x_gt"].to(device)
@@ -291,22 +377,80 @@ def run_validation(model, loader, lambda_coil, lambda_dc, device, logger, step, 
         tok_us_re  = batch["tok_us_re"].to(device)  if "tok_us_re"  in batch else None
         tok_us_im  = batch["tok_us_im"].to(device)  if "tok_us_im"  in batch else None
         tok_gt_rss = batch["tok_gt_rss"].to(device) if "tok_gt_rss" in batch else None
+        fnames     = batch["fname"]
+        slice_nums = batch["slice_num"]
+        max_vals   = batch["max_val"]
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out  = model(x_us, x_gt, kspace_us, mask, num_coils, simple=simple,
-                         tok_us_re=tok_us_re, tok_us_im=tok_us_im, tok_gt_rss=tok_gt_rss)
+            out = model(x_us, x_gt, kspace_us, mask, num_coils, simple=simple,
+                        tok_us_re=tok_us_re, tok_us_im=tok_us_im, tok_gt_rss=tok_gt_rss)
             loss, l_ce, l_lat, l_dc = compute_loss(out, lambda_coil, lambda_dc)
-        total  += loss.item()
-        n_ce   += l_ce.item()
-        n_lat  += l_lat.item()
-        n_dc   += l_dc.item()
-        count  += 1
+        total += loss.item()
+        n_ce  += l_ce.item()
+        n_lat += l_lat.item()
+        n_dc  += l_dc.item()
+        count += 1
+
+        # ---- decode predictions → RSS images --------------------------------
+        if simple:
+            # Teacher-forced argmax gives a fast approximation (no AR loop).
+            pred_idx = out["logits"].argmax(dim=-1)          # (B, K, L)
+            pred_img = meditok.idx_to_img(pred_idx)          # (B, 3, H, W) in [-1, 1]
+            pred_rss = (pred_img.mean(dim=1) + 1.0) / 2.0   # (B, H, W) in [0, 1]
+        else:
+            coil_re, coil_im = [], []
+            C_eff = int(num_coils.min().item())
+            for c in range(C_eff):
+                ir, ii = decode_coil_latents(
+                    meditok, out["h_hat_re"][:, c], out["h_hat_im"][:, c]
+                )
+                coil_re.append(ir)
+                coil_im.append(ii)
+            stacked_re = torch.stack(coil_re, dim=1)
+            stacked_im = torch.stack(coil_im, dim=1)
+            pred_rss = torch.sqrt((stacked_re ** 2 + stacked_im ** 2).sum(dim=1))
+
+        # zero-padded coils contribute 0 to RSS, so using full x_gt is correct
+        gt_rss = rss_from_coils(x_gt)   # (B, H, W)
+        us_rss = rss_from_coils(x_us)   # (B, H, W)
+
+        B = x_us.shape[0]
+        for i in range(B):
+            max_val = float(max_vals[i])
+            gt_np   = (gt_rss[i]   * max_val).cpu().float().numpy()
+            pred_np = (pred_rss[i] * max_val).cpu().float().numpy()
+            us_np   = (us_rss[i]   * max_val).cpu().float().numpy()
+            fname   = fnames[i]
+            sl      = int(slice_nums[i])
+            scan_buf[fname]["rec"].append(pred_np)
+            scan_buf[fname]["gt"].append(gt_np)
+            scan_buf[fname]["us"].append(us_np)
+            scan_buf[fname]["slice"].append(sl)
+
     n = max(count, 1)
     logger.info(
         f"[val @ step {step}]  "
         f"loss={total/n:.4f}  ce={n_ce/n:.4f}  lat={n_lat/n:.4f}  dc_img={n_dc/n:.4f}"
     )
+
+    # ---- image-quality metrics ----------------------------------------------
+    metrics_input = {
+        k: {"rec": v["rec"], "gt": v["gt"], "slice": v["slice"]}
+        for k, v in scan_buf.items()
+    }
+    metrics = compute_reconstruction_metrics(metrics_input, device)
+    logger.info(
+        f"[val @ step {step}]  "
+        f"PSNR={metrics['psnr_mean']:.3f}  SSIM={metrics['ssim_mean']:.4f}  "
+        f"LPIPS={metrics['lpips_mean']:.4f}  NMSE={metrics['nmse_mean']:.6f}"
+    )
+
+    # ---- save centre-slice images -------------------------------------------
+    if output_dir is not None and max_vis_scans > 0:
+        _save_val_images(scan_buf, Path(output_dir), step, max_vis_scans)
+
     model.train()
-    return total / n
+    return total / n, metrics["psnr_mean"]
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +520,7 @@ def main():
         n_virtual_coils=args.n_virtual_coils,
         min_coils=args.min_coils,
     )
+    val_dataset = _filter_dataset_by_split(val_dataset, args.val_split_file)
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_ddp else None
     _use_workers = args.num_workers > 0
     train_loader = DataLoader(
@@ -492,10 +637,11 @@ def main():
     # ------------------------------------------------------------------
     import time
     model.train()
-    step      = start_step
-    data_iter = iter(train_loader)
-    t_last    = time.perf_counter()
+    step            = start_step
+    data_iter       = iter(train_loader)
+    t_last          = time.perf_counter()
     steps_since_log = 0
+    best_val_psnr   = -float("inf")
 
     # Overfit mode: grab one batch and reuse it every step
     _epoch = 0
@@ -571,9 +717,36 @@ def main():
         # Validation (rank 0 only; barrier keeps other ranks alive)
         if step % args.val_every == 0:
             if is_main:
-                run_validation(model_raw, val_loader, args.lambda_coil, args.lambda_dc, device, logger, step, simple=args.simple)
+                val_loss, val_psnr = run_validation(
+                    model_raw, meditok, val_loader,
+                    args.lambda_coil, args.lambda_dc,
+                    device, logger, step,
+                    simple=args.simple,
+                    output_dir=args.output_dir,
+                    max_vis_scans=args.val_max_images,
+                )
                 t_last = time.perf_counter()
                 steps_since_log = 0
+
+                # Always save the most recent checkpoint
+                _ckpt = {
+                    "model":     model_raw.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "steps":     step,
+                    "args":      args,
+                    "val_psnr":  val_psnr,
+                }
+                latest_path = Path(args.output_dir) / "latest.pt"
+                torch.save(_ckpt, latest_path)
+
+                # Save best-PSNR checkpoint
+                if val_psnr > best_val_psnr:
+                    best_val_psnr = val_psnr
+                    best_path = Path(args.output_dir) / "best_psnr.pt"
+                    torch.save(_ckpt, best_path)
+                    logger.info(
+                        f"new best PSNR {val_psnr:.3f} dB → {best_path}"
+                    )
             if is_ddp:
                 dist.barrier()
 
@@ -581,7 +754,7 @@ def main():
         if is_main and args.vis_every > 0 and step % args.vis_every == 0:
             save_train_vis(meditok, out, x_us, x_gt, Path(args.output_dir), step)
 
-        # Checkpoint (rank 0 only)
+        # Periodic checkpoint (rank 0 only)
         if is_main and step % args.save_every == 0:
             ckpt_path = Path(args.output_dir) / f"{step:07d}.pt"
             torch.save(
