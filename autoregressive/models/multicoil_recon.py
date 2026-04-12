@@ -438,8 +438,8 @@ class MulticoilRecon(nn.Module):
             # encode_with_ste returns z_e (continuous pre-quant features)
             chunks_h = []
             for c in gt_imgs.split(self.enc_chunk_size):
-                img4 = c.unsqueeze(-1).repeat(1,1,1,3).permute(0,3,1,2)
-                chunks_h.append(self.meditok.encode_with_ste(img4)[2])
+                # encode_with_ste expects (N, H, W) and handles the →(N,3,H,W) conversion internally
+                chunks_h.append(self.meditok.encode_with_ste(c)[2])
             gt_h = torch.cat(chunks_h, dim=0)  # (2N, L, Dh)
 
         Dh = gt_h.shape[-1]

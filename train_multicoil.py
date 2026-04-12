@@ -349,6 +349,13 @@ def parse_args():
     p.add_argument("--no_scheduler", action="store_true",
                    help="disable cosine LR scheduler; use constant LR throughout")
     p.add_argument("--resume",      default=None, help="path to checkpoint to resume from")
+    p.add_argument("--pretrain_backbone", default=None,
+                   help="load backbone weights from a (simple-mode) checkpoint "
+                        "without restoring optimizer state or step counter; "
+                        "use with --freeze_backbone to train the coil decoder only")
+    p.add_argument("--freeze_backbone", action="store_true",
+                   help="freeze coil_fuser / cross_coil_fusion / shared_transformer / "
+                        "token_head and train only the coil_decoder")
 
     return p.parse_args()
 
@@ -612,6 +619,39 @@ def main():
         start_step = ckpt.get("steps", 0)
         logger.info(f"resumed from {args.resume} at step {start_step}")
 
+    if args.pretrain_backbone:
+        ckpt = torch.load(args.pretrain_backbone, map_location="cpu")
+        model.load_state_dict(ckpt["model"], strict=True)
+        logger.info(f"loaded backbone weights from {args.pretrain_backbone} "
+                    f"(step {ckpt.get('steps', '?')}); optimizer/step reset to 0")
+
+    if args.freeze_backbone:
+        # model is still unwrapped here (DDP wrapping happens below)
+        frozen_modules = [
+            model.coil_fuser,
+            model.cross_coil_fusion,
+            model.shared_transformer,
+            model.token_head,
+        ]
+        for m in frozen_modules:
+            for p in m.parameters():
+                p.requires_grad_(False)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            f"backbone frozen — only coil_decoder trains; "
+            f"trainable params after freeze: {trainable:,}"
+        )
+        # Re-build optimizer so it only covers the now-unfrozen coil_decoder params.
+        optimizer = create_optimizer(
+            model,
+            weight_decay  = args.weight_decay,
+            learning_rate = args.lr,
+            betas         = (0.9, 0.95),
+            logger        = logger,
+        )
+        if not args.no_scheduler:
+            scheduler = get_cosine_scheduler(optimizer, args.max_steps, base_lr=args.lr)
+
     # ------------------------------------------------------------------
     # Wrap in DDP (after optimizer creation so param references stay valid)
     # ------------------------------------------------------------------
@@ -642,6 +682,8 @@ def main():
     t_last          = time.perf_counter()
     steps_since_log = 0
     best_val_psnr   = -float("inf")
+    _last_period_ckpt = None   # Path of the most recently saved save_every checkpoint
+    _last_best_ckpt   = None   # Path of the most recently saved best-PSNR checkpoint
 
     # Overfit mode: grab one batch and reuse it every step
     _epoch = 0
@@ -717,7 +759,7 @@ def main():
         # Validation (rank 0 only; barrier keeps other ranks alive)
         if step % args.val_every == 0:
             if is_main:
-                val_loss, val_psnr = run_validation(
+                _, val_psnr = run_validation(
                     model_raw, meditok, val_loader,
                     args.lambda_coil, args.lambda_dc,
                     device, logger, step,
@@ -728,25 +770,22 @@ def main():
                 t_last = time.perf_counter()
                 steps_since_log = 0
 
-                # Always save the most recent checkpoint
-                _ckpt = {
-                    "model":     model_raw.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "steps":     step,
-                    "args":      args,
-                    "val_psnr":  val_psnr,
-                }
-                latest_path = Path(args.output_dir) / "latest.pt"
-                torch.save(_ckpt, latest_path)
-
-                # Save best-PSNR checkpoint
+                # Save best-PSNR checkpoint (rolling — delete previous)
                 if val_psnr > best_val_psnr:
                     best_val_psnr = val_psnr
-                    best_path = Path(args.output_dir) / "best_psnr.pt"
+                    _ckpt = {
+                        "model":     model_raw.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "steps":     step,
+                        "args":      args,
+                        "val_psnr":  val_psnr,
+                    }
+                    best_path = Path(args.output_dir) / f"{step:07d}_best_psnr.pt"
                     torch.save(_ckpt, best_path)
-                    logger.info(
-                        f"new best PSNR {val_psnr:.3f} dB → {best_path}"
-                    )
+                    if _last_best_ckpt is not None and _last_best_ckpt.exists():
+                        _last_best_ckpt.unlink()
+                    _last_best_ckpt = best_path
+                    logger.info(f"new best PSNR {val_psnr:.3f} dB → {best_path}")
             if is_ddp:
                 dist.barrier()
 
@@ -754,7 +793,7 @@ def main():
         if is_main and args.vis_every > 0 and step % args.vis_every == 0:
             save_train_vis(meditok, out, x_us, x_gt, Path(args.output_dir), step)
 
-        # Periodic checkpoint (rank 0 only)
+        # Periodic checkpoint (rank 0 only) — rolling, deletes previous
         if is_main and step % args.save_every == 0:
             ckpt_path = Path(args.output_dir) / f"{step:07d}.pt"
             torch.save(
@@ -766,6 +805,9 @@ def main():
                 },
                 ckpt_path,
             )
+            if _last_period_ckpt is not None and _last_period_ckpt.exists():
+                _last_period_ckpt.unlink()
+            _last_period_ckpt = ckpt_path
             logger.info(f"checkpoint saved: {ckpt_path}")
 
     # Final checkpoint (rank 0 only)

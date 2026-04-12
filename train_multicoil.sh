@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Train MulticoilRecon on fastMRI brain multicoil data.
-#
-# Usage:
-#   bash train_multicoil.sh [extra args...]
-#
-# Example overrides:
-#   bash train_multicoil.sh --batch_size 8 --max_steps 200000
-#   bash train_multicoil.sh --overfit --max_steps 500 --batch_size 1
-
 set -euo pipefail
-cd "$(dirname "$0")"
+export CUDA_VISIBLE_DEVICES="3,4"
+export HDF5_USE_FILE_LOCKING=FALSE
+export NCCL_P2P_DISABLE=1
+MASTER_PORT="${MASTER_PORT:-29501}"
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-TRAIN_PATH="fastmri/brain/multicoil_train"
-VAL_PATH="fastmri/brain/multicoil_val"
+OUTPUT_DIR="results_multicoil/brain/x8/run2_coil_decoders"
+SIMPLE=false
+PRETRAIN_BACKBONE="results_multicoil/brain/x8/run1/0075000.pt"
+FREEZE_BACKBONE=true
 
-MEDITOK_CONFIG="/fast/lev/meditok/weights/meditok/config.json"
-MEDITOK_CKPT="/fast/lev/meditok/weights/meditok/meditok_ckpt_v1.pth"
-
-OUTPUT_DIR="results_multicoil/brain/x8/debug"
+# Optional: restrict val set to a fixed split file (one H5 filename per line).
+# Leave empty to use the full val_path directory.
+VAL_SPLIT_FILE="fastmri/splits/suno_brain_test.txt"   # e.g. "fastmri/splits/suno_brain_test.txt"
 
 # ---------------------------------------------------------------------------
 # Mask / acceleration
@@ -33,18 +28,13 @@ ACCELERATION=8       # choose from: 4, 8, 10, 16 (must match a cached subdir)
 # Pre-compute once with precompute_tokens.py, then set USE_CACHE=true.
 # Cache layout: {TOKEN_CACHE}/acc{ACCELERATION}_cf{CF}/{stem}.pt
 # ---------------------------------------------------------------------------
-TOKEN_CACHE_TRAIN="token_cache/brain/train"
-TOKEN_CACHE_VAL="token_cache/brain/val"
 USE_CACHE=false
 
 # ---------------------------------------------------------------------------
 # VCC (Virtual Coil Compression)
 # Pre-compute once with precompute_vcc.py, then set VCC_DIR_TRAIN/VAL.
-# Omit --vcc_matrix_dir to use raw physical coils (default).
 # C'=8 recommended (see results_vcc_benchmark/results.csv).
 # ---------------------------------------------------------------------------
-VCC_DIR_TRAIN="vcc_matrices/brain/train"
-VCC_DIR_VAL="vcc_matrices/brain/val"
 N_VIRTUAL_COILS=4
 USE_VCC=true
 
@@ -92,6 +82,21 @@ VIS_EVERY=200
 #     --accelerations 4 8 10 16  --center_fraction 0.04  --n_masks 25 \
 #     --batch_size 64  --slice_batch_size 4  --num_workers 4
 
+
+# ---------------------------------------------------------------------------
+# Hardcoded paths 
+# # ---------------------------------------------------------------------------
+TRAIN_PATH="fastmri/brain/multicoil_train"
+VAL_PATH="fastmri/brain/multicoil_val"
+
+MEDITOK_CONFIG="/fast/lev/meditok/weights/meditok/config.json"
+MEDITOK_CKPT="/fast/lev/meditok/weights/meditok/meditok_ckpt_v1.pth"
+
+VCC_DIR_TRAIN="vcc_matrices/brain/train"
+VCC_DIR_VAL="vcc_matrices/brain/val"
+
+TOKEN_CACHE_TRAIN="token_cache/brain/train"
+TOKEN_CACHE_VAL="token_cache/brain/val"
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -105,15 +110,19 @@ if [ "${USE_VCC}" = "true" ]; then
     VCC_ARGS="--vcc_matrix_dir ${VCC_DIR_TRAIN} --vcc_matrix_dir_val ${VCC_DIR_VAL} --n_virtual_coils ${N_VIRTUAL_COILS}"
 fi
 
-export CUDA_VISIBLE_DEVICES="3,4"
-# Disable HDF5 POSIX file locking — prevents deadlock when multiple DDP
-# worker processes open the same .h5 file concurrently.
-export HDF5_USE_FILE_LOCKING=FALSE
-# G292-Z45 GPUs connect via PCIe host bridge (NODE topology, no NVLink).
-# NCCL's PCIe P2P path busy-waits indefinitely on this topology; force the
-# host-memory shared-memory path instead.
-export NCCL_P2P_DISABLE=1
-MASTER_PORT="${MASTER_PORT:-29501}"
+SPLIT_ARGS=""
+if [ -n "${VAL_SPLIT_FILE}" ]; then
+    SPLIT_ARGS="--val_split_file ${VAL_SPLIT_FILE}"
+fi
+
+PRETRAIN_ARGS=""
+if [ -n "${PRETRAIN_BACKBONE:-}" ]; then
+    PRETRAIN_ARGS="--pretrain_backbone ${PRETRAIN_BACKBONE}"
+    if [ "${FREEZE_BACKBONE:-false}" = "true" ]; then
+        PRETRAIN_ARGS="${PRETRAIN_ARGS} --freeze_backbone"
+    fi
+fi
+
 NGPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
 if [ "${NGPUS}" -gt 1 ]; then
     LAUNCHER="torchrun --nproc_per_node ${NGPUS} --master_port ${MASTER_PORT}"
@@ -147,7 +156,9 @@ ${LAUNCHER} train_multicoil.py \
     --weight_decay     "${WEIGHT_DECAY}"     \
     --vis_every        "${VIS_EVERY}"        \
     --no_scheduler \
-    --simple       \
-    ${CACHE_ARGS}  \
-    ${VCC_ARGS}    \
+    $([ "${SIMPLE:-true}" = "true" ] && echo "--simple") \
+    ${CACHE_ARGS}    \
+    ${VCC_ARGS}      \
+    ${SPLIT_ARGS}    \
+    ${PRETRAIN_ARGS} \
     "$@"
