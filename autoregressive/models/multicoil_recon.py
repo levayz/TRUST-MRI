@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from dataset.data.fftc import fft2c_new as fft2c
+from dataset.data.fftc import fft2c_new as fft2c, ifft2c_new as ifft2c
 from .gpt_kar import (
     ModelArgs,
     TokenEmbedder,
@@ -194,6 +194,70 @@ class CoilDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Image-domain helpers (used by full mode image loss)
+# ---------------------------------------------------------------------------
+
+def decode_coil_latents(
+    meditok,
+    h_hat_re: Tensor,
+    h_hat_im: Tensor,
+    quantize: bool = True,
+    chunk_size: int = 8,
+) -> Tuple[Tensor, Tensor]:
+    """Decode per-coil pre-quant features to (B, H, W) grayscale images.
+
+    quantize=True  (default) — snap to nearest VQ codebook entry, then decode.
+                               Runs under no_grad. Used for evaluation/validation.
+    quantize=False           — decode directly via post_quant_proj + decoder with
+                               gradient checkpointing. Gradients flow back to h_hat.
+                               Used for the image-domain training loss.
+    """
+    if quantize:
+        with torch.no_grad():
+            idx_re = meditok.quantizer.f_to_idx(h_hat_re)
+            idx_im = meditok.quantizer.f_to_idx(h_hat_im)
+            img_re = meditok.idx_to_img(idx_re)
+            img_im = meditok.idx_to_img(idx_im)
+        return img_re[:, 0], img_im[:, 0]
+    else:
+        from torch.utils.checkpoint import checkpoint
+        def _dec(h: Tensor) -> Tensor:
+            parts = []
+            for chunk in h.split(chunk_size, dim=0):
+                feat = meditok.post_quant_proj(chunk)
+                parts.append(
+                    checkpoint(meditok.decoder, feat, use_reentrant=False).clamp(-1, 1)[:, 0]
+                )
+            return torch.cat(parts, dim=0)
+        return _dec(h_hat_re), _dec(h_hat_im)
+
+
+def image_dc(pred_coil_imgs: Tensor, kspace_us: Tensor, mask: Tensor) -> Tensor:
+    """Batched per-coil k-space data consistency (no Python loop over coils).
+
+    Replaces predicted k-space values at acquired locations with the measured
+    values, then converts back to image domain via IFFT.
+
+    Args:
+        pred_coil_imgs: (B, C_eff, H, W, 2) predicted complex coil images
+        kspace_us:      (B, C_max, H, W, 2) undersampled k-space from batch
+        mask:           (B, 1, 1, W, 1) Cartesian mask (1 = acquired)
+
+    Returns:
+        (B, C_eff, H, W, 2) DC-corrected complex coil images
+    """
+    B, C_eff, H, W, _ = pred_coil_imgs.shape
+    # Flatten batch × coil for a single batched FFT call
+    kspace_pred = fft2c(pred_coil_imgs.reshape(B * C_eff, H, W, 2))  # (N, H, W, 2)
+    kspace_pred = kspace_pred.reshape(B, C_eff, H, W, 2)
+    # mask (B, 1, 1, W, 1) broadcasts over (B, C_eff, H, W, 2):
+    #   dim1 1→C_eff, dim2 1→H, dim4 1→2 — correct for 1D Cartesian column masks
+    kspace_dc = kspace_pred * (1 - mask) + kspace_us[:, :C_eff] * mask
+    dc_imgs = ifft2c(kspace_dc.reshape(B * C_eff, H, W, 2))           # (N, H, W, 2)
+    return dc_imgs.reshape(B, C_eff, H, W, 2)
+
+
+# ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
@@ -201,11 +265,13 @@ def compute_loss(
     out: dict,
     lambda_coil: float = 0.1,
     lambda_dc: float   = 1.0,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    lambda_img: float  = 0.0,
+    lambda_ce: float   = 1.0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Compute total training loss.
 
     Returns:
-        (loss_total, loss_ce, loss_lat, loss_dc)
+        (loss_total, loss_ce, loss_lat, loss_dc, loss_img)
     """
     # logits: (B, K, L, vpc)  targets: (B, K, L)
     B, K, L, vpc = out["logits"].shape
@@ -222,26 +288,27 @@ def compute_loss(
     else:
         loss_lat = loss_ce.new_zeros(())
 
-    if "kspace_dc_err" in out:
+    if torch.is_tensor(out.get("kspace_dc_err")):
         loss_dc = out["kspace_dc_err"].abs().mean()
     else:
         loss_dc = loss_ce.new_zeros(())
 
-    total = loss_ce + lambda_coil * loss_lat + lambda_dc * loss_dc
-    return total, loss_ce, loss_lat, loss_dc
+    if "pred_rss_dc" in out:
+        import piq
+        pred_rss_dc = out["pred_rss_dc"]        # (B, H, W)
+        gt_rss      = out["targets"]["gt_rss"]  # (B, H, W)
+        loss_l1  = (pred_rss_dc - gt_rss).abs().mean()
+        # piq.ssim expects (B, 1, H, W) in [0, 1]; normalise by per-image GT max
+        gt_max    = gt_rss.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+        pred_norm = (pred_rss_dc / gt_max).clamp(0, 1).unsqueeze(1)
+        gt_norm   = (gt_rss      / gt_max).clamp(0, 1).unsqueeze(1)
+        loss_ssim = 1.0 - piq.ssim(pred_norm, gt_norm, data_range=1.0)
+        loss_img  = loss_l1 + loss_ssim
+    else:
+        loss_img = loss_ce.new_zeros(())
 
-
-# ---------------------------------------------------------------------------
-# Inference helper
-# ---------------------------------------------------------------------------
-
-def decode_coil_latents(meditok, h_hat_re: Tensor, h_hat_im: Tensor) -> Tuple[Tensor, Tensor]:
-    with torch.no_grad():
-        idx_re = meditok.quantizer.f_to_idx(h_hat_re)
-        idx_im = meditok.quantizer.f_to_idx(h_hat_im)
-        img_re = meditok.idx_to_img(idx_re)
-        img_im = meditok.idx_to_img(idx_im)
-    return img_re[:, 0], img_im[:, 0]
+    total = lambda_ce * loss_ce + lambda_coil * loss_lat + lambda_dc * loss_dc + lambda_img * loss_img
+    return total, loss_ce, loss_lat, loss_dc, loss_img
 
 
 # ---------------------------------------------------------------------------
@@ -303,12 +370,13 @@ class MulticoilRecon(nn.Module):
 
     def forward(
         self,
-        x_us:       Optional[Tensor] = None,  # (B, C, H, W, 2)  — not needed when tokens pre-computed
-        x_gt:       Optional[Tensor] = None,  # (B, C, H, W, 2)  — not needed in simple mode
-        kspace_us:  Optional[Tensor] = None,  # unused in simple mode
-        mask:       Optional[Tensor] = None,  # unused in simple mode
-        num_coils:  Optional[Tensor] = None,  # (B,) actual coil counts
-        simple:     bool = False,
+        x_us:             Optional[Tensor] = None,  # (B, C, H, W, 2)  — not needed when tokens pre-computed
+        x_gt:             Optional[Tensor] = None,  # (B, C, H, W, 2)  — not needed in simple mode
+        kspace_us:        Optional[Tensor] = None,  # unused in simple mode
+        mask:             Optional[Tensor] = None,  # unused in simple mode
+        num_coils:        Optional[Tensor] = None,  # (B,) actual coil counts
+        simple:           bool = False,
+        compute_img_loss: bool = False,             # decode coil latents → image, apply DC, compute RSS loss
         # Pre-computed tokens from TokenCachedDataset (skip MedITok encoding)
         tok_us_re:  Optional[Tensor] = None,  # (B, C, K, L)
         tok_us_im:  Optional[Tensor] = None,  # (B, C, K, L)
@@ -456,25 +524,46 @@ class MulticoilRecon(nn.Module):
         h_hat_im = torch.stack(h_hat_im_list, dim=1)
 
         # ------------------------------------------------------------------
-        # 7. k-space DC loss
+        # 8. Image-domain loss inputs (optional, full mode only)
+        #    Decode predicted coil latents through frozen MediTok decoder
+        #    (no quantisation lookup), apply k-space DC per coil, compute RSS.
+        #    Gradients flow back through post_quant_proj + decoder to h_hat.
         # ------------------------------------------------------------------
-        mask_dc      = mask.squeeze(1)
-        kspace_gt_f  = fft2c(x_gt[:, :C_eff].reshape(N, H, W, 2))
-        kspace_us_f  = kspace_us[:, :C_eff].reshape(N, H, W, 2)
-        mask_dc_flat = mask_dc.unsqueeze(1).expand(B, C_eff, 1, W, 1).reshape(N, 1, W, 1)
-        kspace_dc_err = (kspace_gt_f - kspace_us_f) * mask_dc_flat
+        if compute_img_loss and kspace_us is not None and mask is not None:
+            img_re_flat, img_im_flat = decode_coil_latents(
+                self.meditok,
+                h_hat_re.reshape(N, L, Dh),
+                h_hat_im.reshape(N, L, Dh),
+                quantize=False,
+                chunk_size=self.enc_chunk_size,
+            )
+            img_re = img_re_flat.view(B, C_eff, H, W)
+            img_im = img_im_flat.view(B, C_eff, H, W)
+            pred_coil_imgs = torch.stack([img_re, img_im], dim=-1)      # (B, C_eff, H, W, 2)
+
+            dc_imgs     = image_dc(pred_coil_imgs, kspace_us, mask)     # (B, C_eff, H, W, 2)
+            mag         = torch.sqrt((dc_imgs ** 2).sum(dim=-1))        # (B, C_eff, H, W)
+            pred_rss_dc = torch.sqrt((mag ** 2).sum(dim=1))             # (B, H, W)
+            gt_rss_img  = rss_from_coils(x_gt[:, :C_eff])              # (B, H, W)
+
+            extra_out     = {"pred_rss_dc": pred_rss_dc}
+            extra_targets = {"gt_rss": gt_rss_img}
+        else:
+            extra_out = extra_targets = {}
 
         return {
             "logits":        logits,
             "z":             z,
             "h_hat_re":      h_hat_re,
             "h_hat_im":      h_hat_im,
-            "kspace_dc_err": kspace_dc_err,
+            "kspace_dc_err": None,
+            **extra_out,
             "targets": {
                 "rss_tokens": t_rss,
                 "h_gt_re":    h_gt_re,
                 "h_gt_im":    h_gt_im,
                 "x_gt":       x_gt[:, :C_eff],
+                **extra_targets,
             },
         }
 

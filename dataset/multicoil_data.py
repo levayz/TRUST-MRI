@@ -173,6 +173,9 @@ class MulticoilTransform:
 
         x_gt = (x_gt / max_val).clamp(-1.0, 1.0)          # (C, H', W', 2)
         x_us = (x_us / max_val).clamp(-1.0, 1.0)          # (C, H', W', 2)
+        # kspace_us was raw (unnormalized); recompute from normalized x_us so that
+        # kspace_us / max_val = fft2c(x_us) — consistent scale with decoded predictions
+        kspace_us = fft2c(x_us)                            # (C, H', W', 2)
 
         # ------------------------------------------------------------------ #
         # 6. Pad coil dimension so batches can be stacked.

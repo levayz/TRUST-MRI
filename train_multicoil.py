@@ -54,6 +54,7 @@ from autoregressive.models.multicoil_recon import (
     build_multicoil_recon,
     compute_loss,
     decode_coil_latents,
+    image_dc,
     rss_from_coils,
 )
 from autoregressive.utils.metrics import compute_reconstruction_metrics
@@ -117,6 +118,7 @@ class DotDict(dict):
 
 @torch.no_grad()
 def save_train_vis(meditok, out: dict, x_us: torch.Tensor, x_gt: torch.Tensor,
+                   kspace_us: torch.Tensor, mask: torch.Tensor,
                    output_dir: Path, step: int):
     """Save a 4-panel image reusing the already-computed training step output:
         [Undersampled RSS | GT RSS | Predicted RSS | |Pred − GT|]
@@ -144,15 +146,24 @@ def save_train_vis(meditok, out: dict, x_us: torch.Tensor, x_gt: torch.Tensor,
         gt_roundtrip = (gt_rt_img.mean(dim=1) + 1.0) / 2.0         # (B, H, W) in [0,1]
         C_eff = x_us.shape[1]
     else:
-        C_eff = out["h_hat_re"].shape[1]
-        coil_re, coil_im = [], []
-        for c in range(C_eff):
-            img_re, img_im = decode_coil_latents(meditok, out["h_hat_re"][:, c], out["h_hat_im"][:, c])
-            coil_re.append(img_re)
-            coil_im.append(img_im)
-        stacked_re = torch.stack(coil_re, dim=1)
-        stacked_im = torch.stack(coil_im, dim=1)
-        pred_rss   = torch.sqrt((stacked_re ** 2 + stacked_im ** 2).sum(dim=1))
+        B_vis, C_eff, L, Dh = out["h_hat_re"].shape
+        _, _, H_vis, W_vis, _ = x_us.shape
+        N_vis = B_vis * C_eff
+        if "pred_rss_dc" in out:
+            # DC-corrected prediction already computed by the image-domain loss path — use it.
+            pred_rss = out["pred_rss_dc"]                               # (B, H, W)
+        else:
+            img_re_flat, img_im_flat = decode_coil_latents(
+                meditok,
+                out["h_hat_re"].reshape(N_vis, L, Dh),
+                out["h_hat_im"].reshape(N_vis, L, Dh),
+            )
+            stacked_re     = img_re_flat.view(B_vis, C_eff, H_vis, W_vis)
+            stacked_im     = img_im_flat.view(B_vis, C_eff, H_vis, W_vis)
+            pred_coil_imgs = torch.stack([stacked_re, stacked_im], dim=-1)
+            dc_imgs        = image_dc(pred_coil_imgs, kspace_us, mask)
+            mag            = torch.sqrt((dc_imgs ** 2).sum(dim=-1))
+            pred_rss       = torch.sqrt((mag ** 2).sum(dim=1))
 
     us_rss = rss_from_coils(x_us[:, :C_eff])   # (B, H, W)
     gt_rss = rss_from_coils(x_gt[:, :C_eff])
@@ -333,6 +344,9 @@ def parse_args():
     p.add_argument("--weight_decay",type=float, default=0.05)
     p.add_argument("--lambda_coil", type=float, default=0.1,  help="weight for latent L1 loss")
     p.add_argument("--lambda_dc",   type=float, default=1.0,  help="weight for data-consistency image L1 loss")
+    p.add_argument("--lambda_img",  type=float, default=0.0,
+                   help="weight for image-domain RSS loss (L1 + 1-SSIM); "
+                        "0 disables the loss and skips the decoder forward pass")
     p.add_argument("--max_steps",   type=int,   default=100_000)
     p.add_argument("--grad_clip",   type=float, default=1.0)
     p.add_argument("--num_workers", type=int,   default=4)
@@ -356,6 +370,8 @@ def parse_args():
     p.add_argument("--freeze_backbone", action="store_true",
                    help="freeze coil_fuser / cross_coil_fusion / shared_transformer / "
                         "token_head and train only the coil_decoder")
+    p.add_argument("--mixed_precision", default="bf16", choices=["none", "bf16", "fp16"],
+                   help="mixed precision mode: none=fp32, bf16=bfloat16, fp16=float16+GradScaler")
 
     return p.parse_args()
 
@@ -366,11 +382,12 @@ def parse_args():
 
 @torch.no_grad()
 def run_validation(
-    model, meditok, loader, lambda_coil, lambda_dc, device, logger, step,
+    model, meditok, loader, lambda_coil, lambda_dc, lambda_img, lambda_ce, ptdtype, device, logger, step,
     simple=False, output_dir=None, max_vis_scans=4,
 ):
     model.eval()
-    total, n_ce, n_lat, n_dc, count = 0.0, 0.0, 0.0, 0.0, 0
+    compute_img = False   # image-domain decoder is training-only; validation uses quantized decode + DC
+    total, n_ce, n_lat, n_dc, n_img, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0
 
     # per-scan accumulators: fname → {"rec", "gt", "us", "slice"}
     scan_buf = defaultdict(lambda: {"rec": [], "gt": [], "us": [], "slice": []})
@@ -388,14 +405,16 @@ def run_validation(
         slice_nums = batch["slice_num"]
         max_vals   = batch["max_val"]
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast(dtype=ptdtype):
             out = model(x_us, x_gt, kspace_us, mask, num_coils, simple=simple,
+                        compute_img_loss=compute_img,
                         tok_us_re=tok_us_re, tok_us_im=tok_us_im, tok_gt_rss=tok_gt_rss)
-            loss, l_ce, l_lat, l_dc = compute_loss(out, lambda_coil, lambda_dc)
+            loss, l_ce, l_lat, l_dc, l_img = compute_loss(out, lambda_coil, lambda_dc, lambda_img, lambda_ce)
         total += loss.item()
         n_ce  += l_ce.item()
         n_lat += l_lat.item()
         n_dc  += l_dc.item()
+        n_img += l_img.item()
         count += 1
 
         # ---- decode predictions → RSS images --------------------------------
@@ -405,17 +424,22 @@ def run_validation(
             pred_img = meditok.idx_to_img(pred_idx)          # (B, 3, H, W) in [-1, 1]
             pred_rss = (pred_img.mean(dim=1) + 1.0) / 2.0   # (B, H, W) in [0, 1]
         else:
-            coil_re, coil_im = [], []
-            C_eff = int(num_coils.min().item())
-            for c in range(C_eff):
-                ir, ii = decode_coil_latents(
-                    meditok, out["h_hat_re"][:, c], out["h_hat_im"][:, c]
-                )
-                coil_re.append(ir)
-                coil_im.append(ii)
-            stacked_re = torch.stack(coil_re, dim=1)
-            stacked_im = torch.stack(coil_im, dim=1)
-            pred_rss = torch.sqrt((stacked_re ** 2 + stacked_im ** 2).sum(dim=1))
+            B_loc, _, L, Dh = out["h_hat_re"].shape
+            C_eff  = int(num_coils.min().item())
+            _, _, H, W, _  = x_us.shape
+            N      = B_loc * C_eff
+            # Flatten batch×coil for a single batched decode call
+            img_re_flat, img_im_flat = decode_coil_latents(
+                meditok,
+                out["h_hat_re"][:, :C_eff].reshape(N, L, Dh),
+                out["h_hat_im"][:, :C_eff].reshape(N, L, Dh),
+            )                                                               # (N, H, W) each
+            stacked_re     = img_re_flat.view(B_loc, C_eff, H, W)
+            stacked_im     = img_im_flat.view(B_loc, C_eff, H, W)
+            pred_coil_imgs = torch.stack([stacked_re, stacked_im], dim=-1) # (B, C_eff, H, W, 2)
+            dc_imgs        = image_dc(pred_coil_imgs, kspace_us, mask)     # (B, C_eff, H, W, 2)
+            mag            = torch.sqrt((dc_imgs ** 2).sum(dim=-1))        # (B, C_eff, H, W)
+            pred_rss       = torch.sqrt((mag ** 2).sum(dim=1))             # (B, H, W)
 
         # zero-padded coils contribute 0 to RSS, so using full x_gt is correct
         gt_rss = rss_from_coils(x_gt)   # (B, H, W)
@@ -437,7 +461,8 @@ def run_validation(
     n = max(count, 1)
     logger.info(
         f"[val @ step {step}]  "
-        f"loss={total/n:.4f}  ce={n_ce/n:.4f}  lat={n_lat/n:.4f}  dc_img={n_dc/n:.4f}"
+        f"loss={total/n:.4f}  ce={n_ce/n:.4f}  lat={n_lat/n:.4f}  "
+        f"dc_img={n_dc/n:.4f}  img={n_img/n:.4f}"
     )
 
     # ---- image-quality metrics ----------------------------------------------
@@ -652,6 +677,14 @@ def main():
         if not args.no_scheduler:
             scheduler = get_cosine_scheduler(optimizer, args.max_steps, base_lr=args.lr)
 
+    # CE loss is irrelevant when backbone is frozen (token_head has no grad path
+    # to coil_decoder). Zero it out so the logged total reflects actual training signal.
+    lambda_ce = 0.0 if args.freeze_backbone else 1.0
+
+    ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
+    # GradScaler is a no-op for bf16/fp32; only active for fp16
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == 'fp16'))
+
     # ------------------------------------------------------------------
     # Wrap in DDP (after optimizer creation so param references stay valid)
     # ------------------------------------------------------------------
@@ -722,21 +755,26 @@ def main():
             dist.all_reduce(c_min, op=dist.ReduceOp.MIN)
             num_coils = num_coils.clamp(max=int(c_min.item()))
 
+        compute_img = (not args.simple) and (args.lambda_img > 0)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast(dtype=ptdtype):
             out = model(x_us, x_gt, kspace_us, mask, num_coils,
                         simple=args.simple,
+                        compute_img_loss=compute_img,
                         tok_us_re=tok_us_re, tok_us_im=tok_us_im, tok_gt_rss=tok_gt_rss)
-            loss, l_ce, l_lat, l_dc = compute_loss(out, args.lambda_coil, args.lambda_dc)
-        loss.backward()
+            loss, l_ce, l_lat, l_dc, l_img = compute_loss(
+                out, args.lambda_coil, args.lambda_dc, args.lambda_img, lambda_ce)
+        scaler.scale(loss).backward()
 
         if args.grad_clip > 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
                 args.grad_clip,
             )
 
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         if scheduler is not None:
             scheduler.step()
         step += 1
@@ -753,6 +791,7 @@ def main():
                 f"step {step}/{args.max_steps}  "
                 f"loss={loss.item():.4f}  ce={l_ce.item():.4f}  "
                 f"lat={l_lat.item():.4f}  dc_img={l_dc.item():.4f}  "
+                f"img={l_img.item():.4f}  "
                 f"lr={lr_now:.2e}  {sps:.2f} steps/s"
             )
 
@@ -761,7 +800,7 @@ def main():
             if is_main:
                 _, val_psnr = run_validation(
                     model_raw, meditok, val_loader,
-                    args.lambda_coil, args.lambda_dc,
+                    args.lambda_coil, args.lambda_dc, args.lambda_img, lambda_ce, ptdtype,
                     device, logger, step,
                     simple=args.simple,
                     output_dir=args.output_dir,
@@ -791,7 +830,7 @@ def main():
 
         # Visualisation (rank 0 only)
         if is_main and args.vis_every > 0 and step % args.vis_every == 0:
-            save_train_vis(meditok, out, x_us, x_gt, Path(args.output_dir), step)
+            save_train_vis(meditok, out, x_us, x_gt, kspace_us, mask, Path(args.output_dir), step)
 
         # Periodic checkpoint (rank 0 only) — rolling, deletes previous
         if is_main and step % args.save_every == 0:
