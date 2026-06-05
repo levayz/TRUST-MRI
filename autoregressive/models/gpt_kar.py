@@ -541,7 +541,7 @@ class AutoRegressiveHead(nn.Module):
 
         # concat along channel dimension TODO if concat then cant concat the base tokens
         # index_embeddings = torch.cat((index_embeddings_re, index_embeddings_im), dim=-1)  # [B*Li, K-1, 1536]
-        index_embeddings = index_embeddings_re + index_embeddings_im # TODO maybe something better
+        index_embeddings = index_embeddings_re + index_embeddings_im # TODO maybe something better, add NORM? conct and project back to 768?
         h = torch.cat((base_tokens, index_embeddings), dim=1)  # [B*(1+(Li-1)), 1+(K-1), 768]
         for layer in self.layers:
             h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)
@@ -560,7 +560,7 @@ class AutoRegressiveHead(nn.Module):
             im_idx = idx[:,1]
             h_re = self.codebooks[input_pos - 1](re_idx)
             h_im = self.codebooks[input_pos - 1](im_idx)
-            h = h_re + h_im
+            h = h_re + h_im # TODO add norm?
         else:
             h = base_tokens
         

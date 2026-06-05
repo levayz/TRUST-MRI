@@ -308,3 +308,47 @@ def kspace_uncertainty_from_patch_logits(
             measured[bb, :, rr, cc] = True
 
         return measured, entropy_complex, freq_magnitude_for_display
+
+
+@torch.no_grad()
+def posterior_sampling_scores(
+    samples: torch.Tensor,          # (S, H, W) real RSS images
+    already_measured: torch.Tensor, # (1, 1, W, 1) or (B, 1, W, 1) cartesian mask
+    rank: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select k-space columns by posterior variance energy.
+
+    For each unacquired column c:
+        score(c) = sum_s sum_h |FFT(x_s - mean)[h, c]|^2
+
+    This is the column-wise energy of the posterior variance in k-space.
+
+    Args:
+        samples:          (S, H, W) — S stochastic reconstructions, real-valued RSS
+        already_measured: (1, 1, W, 1) cartesian mask (1 = acquired)
+        rank:             number of columns to select
+
+    Returns:
+        selected_cols: (rank,) column indices
+        col_scores:    (W,) energy score per column (already-measured = 0)
+    """
+    S, H, W = samples.shape
+    device = samples.device
+
+    # Zero-mean across samples: centered[s, h, w]
+    centered = samples - samples.mean(dim=0, keepdim=True)   # (S, H, W)
+
+    # FFT of each centered sample (treat as real: imag = 0)
+    centered_c = torch.stack([centered, torch.zeros_like(centered)], dim=-1)  # (S, H, W, 2)
+    K = fft2(centered_c)   # (S, H, W, 2) — real/imag parts of 2D DFT
+
+    # Energy at each column: sum over samples and rows of |K[s,h,c]|^2
+    K_energy = K[..., 0] ** 2 + K[..., 1] ** 2   # (S, H, W)
+    col_scores = K_energy.sum(dim=(0, 1))          # (W,)
+
+    # Zero out already-measured columns
+    measured = already_measured[0, 0, :, 0].bool()   # (W,)
+    col_scores = col_scores.masked_fill(measured, 0.0)
+
+    selected_cols = col_scores.topk(rank).indices  # (rank,)
+    return selected_cols, col_scores

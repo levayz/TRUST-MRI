@@ -17,7 +17,7 @@ if str(gen_root) not in sys.path:
 
 from autoregressive.models.gpt_kar import KAR_GPT_models as GPT_models
 from autoregressive.models.gpt_kar import PROBE_GPT_B
-from autoregressive.models.generate import reconstruct_far, active_sampling, active_sampling_patch_logits, data_consistency, image_entropy_to_freq_entropy, active_sampling_entropy_gradient, active_sampling_probe_attention
+from autoregressive.models.generate import reconstruct_far, active_sampling, active_sampling_patch_logits, data_consistency, image_entropy_to_freq_entropy, active_sampling_entropy_gradient, active_sampling_probe_attention, active_sampling_posterior_sampling
 from autoregressive.utils.metrics import compute_reconstruction_metrics
 from models.meditok import MedITok, DotDict
 from dataset.build import build_dataset  # expects args.dataset == 'mri_code'
@@ -655,6 +655,8 @@ def validate(
             rec_fn = active_sampling_entropy_gradient
         elif hasattr(args, 'active_sampling_fn') and args.active_sampling_fn == "probe_attention":
             rec_fn = active_sampling_probe_attention
+        elif hasattr(args, 'active_sampling_fn') and args.active_sampling_fn == "posterior_sampling":
+            rec_fn = active_sampling_posterior_sampling
 
     sampling_kwargs = {
         "temperature": getattr(args, 'temperature', 1.0),
@@ -968,7 +970,7 @@ if __name__ == "__main__":
     parser.add_argument("--active-sampling-n-samples", type=int, default=4, help="num generation samples per item")
     parser.add_argument("--budget", type=int, default=None, help="num vertical lines to sample, if None is calculated from image size and accelerations")
     parser.add_argument("--active-sampling-rank", type=int, default=None, help="num of sampled line per active sampling iterations")
-    parser.add_argument("--active-sampling-fn", type=str, default=None, choices=[None, "patch_logits", "gradient", "probe_attention"]) # TODO make consts
+    parser.add_argument("--active-sampling-fn", type=str, default=None, choices=[None, "patch_logits", "gradient", "probe_attention", "posterior_sampling"]) # TODO make consts
     parser.add_argument("--active-sampling-mask-type", type=str, default="cartesian",
         choices=["cartesian", "2d", "poisson"],
         help="Active sampling selection pattern: cartesian=vertical lines, 2d=top-k 2D points, poisson=Poisson-disk-constrained 2D points")

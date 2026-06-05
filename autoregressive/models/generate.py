@@ -79,21 +79,36 @@ def sample_far(logits, temperature: float = 1.0, top_k: int = 0, top_p: float = 
     # logits BL, 2, 1, V/K or BL, 1, V/K
     n_dims = len(logits.shape)
     if n_dims == 3:
-        logits = logits[:, -1, :] / max(temperature, 1e-5)
+        logits = logits[:, -1, :] / max(temperature, 1e-5)   # (BL, V)
     elif n_dims == 4:
-        logits = logits[:, :, -1, :] / max(temperature, 1e-5)
-    if top_k > 0 or top_p < 1.0:
+        logits = logits[:, :, -1, :] / max(temperature, 1e-5)  # (BL, 2, V)
+
+    do_sample = top_k > 0 or top_p < 1.0
+    if not do_sample:
+        # pure temperature sampling: treat every row as a candidate
+        probs = F.softmax(logits, dim=-1)
+        if n_dims == 3:
+            idx = torch.multinomial(probs, num_samples=1)
+        elif n_dims == 4:
+            BL, two, V = probs.shape
+            idx = torch.multinomial(probs.reshape(BL * two, V), num_samples=1).reshape(BL, two)
+        return idx, probs
+
+    # top-k / top-p filtering — top_k_top_p_filtering expects 2D (N, V)
+    if n_dims == 3:
         logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-    else:
-        return logits.argmax(dim=-1), None
+    elif n_dims == 4:
+        BL, two, V = logits.shape
+        logits = top_k_top_p_filtering(logits.reshape(BL * two, V),
+                                       top_k=top_k, top_p=top_p).reshape(BL, two, V)
+
     probs = F.softmax(logits, dim=-1)
     if sample_logits:
         if n_dims == 3:
             idx = torch.multinomial(probs, num_samples=1)
         elif n_dims == 4:
-            idx_re = torch.multinomial(probs[:,0], num_samples=1)
-            idx_im = torch.multinomial(probs[:,1], num_samples=1)
-            idx = torch.cat([idx_re, idx_im], dim=1)
+            BL, two, V = probs.shape
+            idx = torch.multinomial(probs.reshape(BL * two, V), num_samples=1).reshape(BL, two)
     else:
         _, idx = torch.topk(probs, k=1, dim=-1)
     return idx, probs
@@ -543,6 +558,7 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
             return (img[:,0] + img[:,1] + img[:,2]) / 3
 
         i_hat = rgb_to_grayscale(i_hat) # B, H, W, 2
+        i_hat_no_dc = i_hat.clone()    # decoded image before any data consistency
 
         # get mask for next level
         if idx == len(mask_levels) - 1: # done, no more masking
@@ -563,7 +579,7 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
 
     model.rm_head_caches()
 
-    return i_hat, {"gen_progress": gen_prog, "logits": logits_list, "logits_1d": logits_list_1d, "model_aux": aux} # B,H,W,2, [((B,H,W,2), (B,H,W,2)), ...x mask_levels]
+    return i_hat, {"gen_progress": gen_prog, "logits": logits_list, "logits_1d": logits_list_1d, "model_aux": aux, "decoded_no_dc": i_hat_no_dc} # B,H,W,2, [((B,H,W,2), (B,H,W,2)), ...x mask_levels]
 
 
 @torch.no_grad
@@ -640,6 +656,67 @@ def active_sampling_patch_logits(model, tokenizer, gt_image:torch.Tensor, masked
     rec_image, _ = reconstruct_far(model, tokenizer, masked_image, sample_mask, **kwargs) # reconstruct
 
     return rec_image, {"sample_mask": sample_mask, "masked_image": masked_image, "entropy_maps": entropy_maps, "freq_maps": freq_maps, "sample_masks": sample_masks, "sample_progress": sample_progress}
+
+
+@torch.no_grad
+def active_sampling_posterior_sampling(model, tokenizer, gt_image: torch.Tensor, masked_image: torch.Tensor, sample_mask: torch.Tensor, budget: int, rank=1, **kwargs):
+    """Posterior-sampling active acquisition.
+
+    At each step:
+      1. Draw n_samples stochastic reconstructions (top-k / temperature sampling).
+      2. Zero-mean the RSS images across samples.
+      3. Score each unacquired k-space column by the FFT energy of the centered samples.
+      4. Acquire the highest-energy column.
+
+    Sampling kwargs (top_k, temperature, top_p) control the stochasticity of the
+    posterior samples.  Use top_k > 0 or top_p < 1 to enable non-greedy sampling.
+    """
+    from autoregressive.sample.adaptive_sampling import posterior_sampling_scores
+
+    n_samples      = kwargs.get("n_samples", 8)
+    sampling_kwargs = kwargs.pop("sampling_kwargs", {"temperature": 1.0, "top_k": 100, "top_p": 1.0})
+    B, H, W, _    = masked_image.shape
+    n_steps        = budget // rank
+
+    sample_masks    = [sample_mask.clone()]
+    sample_progress = [masked_image.clone()]
+    score_maps      = []
+
+    for _ in tqdm(range(n_steps), "posterior_sampling"):
+        # Batch all n_samples together: one forward pass of size B*S
+        masked_rep = masked_image.repeat(n_samples, 1, 1, 1)   # (S*B, H, W, 2)
+        mask_rep   = sample_mask.repeat(n_samples, 1, 1, 1)    # (S*B, 1, W, 1)
+        rec_batch, _ = reconstruct_far(model, tokenizer, masked_rep, mask_rep,
+                                       sampling_kwargs=sampling_kwargs, **kwargs)
+        # (S*B, H, W, 2) → (S*B, H, W) → (S, B, H, W)
+        samples = transforms.complex_abs(rec_batch).view(n_samples, B, H, W)
+
+        # Score columns per batch item
+        new_mask = sample_mask.clone()
+        for b in range(B):
+            sel_cols, col_scores = posterior_sampling_scores(
+                samples[:, b],           # (S, H, W)
+                sample_mask[b:b+1],
+                rank=rank,
+            )
+            new_mask[b, 0, sel_cols, 0] = 1.0
+            score_maps.append(col_scores.cpu())
+
+        sample_mask = new_mask
+        masked_image = data_consistency(gt_image, torch.zeros_like(masked_image), sample_mask)
+        sample_masks.append(sample_mask.clone())
+        sample_progress.append(masked_image.clone())
+
+    # Final deterministic reconstruction
+    rec_image, _ = reconstruct_far(model, tokenizer, masked_image, sample_mask, **kwargs)
+
+    return rec_image, {
+        "sample_mask": sample_mask,
+        "masked_image": masked_image,
+        "sample_masks": sample_masks,
+        "sample_progress": sample_progress,
+        "score_maps": score_maps,
+    }
 
 
 def soft_lookup(z_e, codebooks, tok_embeddings, temperature=1.0):

@@ -12,8 +12,9 @@ import torch
 
 from .fftc import fft2c_new as _fft2c, ifft2c_new as _ifft2c
 
-# fft2 alias used by autoregressive/sample/adaptive_sampling.py
-fft2 = _fft2c
+# fft2/ifft2 aliases
+fft2  = _fft2c
+ifft2 = _ifft2c
 
 
 def complex_abs(data: torch.Tensor) -> torch.Tensor:
