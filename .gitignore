@@ -29,6 +29,9 @@ results_vcc_benchmark/
 notebooks/
 outputs/
 fastmri/
+checkpoints/
 
 # Misc
 *.pdf
+ISF_grant/
+.ipynb_checkpoints/
