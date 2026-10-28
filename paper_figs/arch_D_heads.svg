@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1340 600" width="1340" height="600" font-family="'IBM Plex Sans', system-ui, sans-serif" style="background:#fbfaf7;color:#1f2328">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/></marker><marker id="ahm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6b7075"/></marker></defs>
+<rect x="20" y="20" width="150" height="40" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="95.0" y="36.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">hidden state h_p</text>
+<text x="95.0" y="51.7" font-size="11" text-anchor="middle" fill="#1f2328">from the body</text>
+<rect x="20" y="90" width="440" height="300" rx="6" fill="none" stroke="#6b7075" stroke-width="0.8" stroke-dasharray="3 3"/>
+<text x="452" y="105" font-size="11.5" font-weight="600" text-anchor="end" fill="#6b7075" letter-spacing="0.4">token head, 8 steps (v2.1)</text>
+<rect x="40" y="125" width="170" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="125.0" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step 0 input</text>
+<text x="125.0" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">h_p + pos₀</text>
+<rect x="270" y="125" width="170" height="44" rx="4" fill="#dbe7f3" stroke="#3b6ea5" stroke-width="1.1"/>
+<text x="355.0" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">1-layer transformer</text>
+<text x="355.0" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">causal over steps, KV cache</text>
+<rect x="270" y="195" width="170" height="44" rx="4" fill="#dbe7f3" stroke="#3b6ea5" stroke-width="1.1"/>
+<text x="355.0" y="213.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">RMSNorm → 2 linears</text>
+<text x="355.0" y="228.7" font-size="11" text-anchor="middle" fill="#1f2328">logits Re_i, Im_i (4096 each)</text>
+<rect x="40" y="265" width="200" height="58" rx="4" fill="#fbe9c6" stroke="#b7791f" stroke-width="1.1"/>
+<text x="140.0" y="283.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step i input (i ≥ 1)</text>
+<text x="140.0" y="298.2" font-size="11" text-anchor="middle" fill="#1f2328">concat E_re(Re_i−1), E_im(Im_i−1)</text>
+<text x="140.0" y="313.2" font-size="11" text-anchor="middle" fill="#1f2328">Linear 2048→1024 + pos_i</text>
+<line x1="95" y1="60" x2="95" y2="125" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="107.0" y="85.0" width="24.5" height="15" fill="#fbfaf7"/><text x="110" y="95" font-size="11" text-anchor="start" fill="#1f2328">h_p</text>
+<line x1="210" y1="147" x2="270" y2="147" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<line x1="355" y1="169" x2="355" y2="195" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<polyline points="270,217 140,217 140,265" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="153.9" y="235.0" width="92.2" height="15" fill="#fbfaf7"/><text x="200" y="245" font-size="11" text-anchor="middle" fill="#1f2328">Re_i−1, Im_i−1</text>
+<polyline points="240,294 255,294 255,160 270,160" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<text x="40" y="350" font-size="11" text-anchor="start" fill="#6b7075">Re_i and Im_i are predicted together at step i.</text>
+<text x="40" y="368" font-size="11" text-anchor="start" fill="#6b7075">v1 head: one shared table, E(Re) + E(Im) summed (symmetric).</text>
+<text x="40" y="386" font-size="11" text-anchor="start" fill="#6b7075">init: Linear = [I  I], pos = 0, so it equals the v1 head at the warm start.</text>
+<rect x="480" y="90" width="420" height="300" rx="6" fill="none" stroke="#6b7075" stroke-width="0.8" stroke-dasharray="3 3"/>
+<text x="892" y="105" font-size="11.5" font-weight="600" text-anchor="end" fill="#6b7075" letter-spacing="0.4">token head, 16 steps (interleaved, run13)</text>
+<rect x="495" y="125" width="125" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="557.5" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step 0</text>
+<text x="557.5" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">h_p + pos₀ → Re₀</text>
+<rect x="630" y="125" width="125" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="692.5" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step 1</text>
+<text x="692.5" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">E_re⁰(Re₀) + pos₁ → Im₀</text>
+<rect x="765" y="125" width="125" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="827.5" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step 2</text>
+<text x="827.5" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">E_im⁰(Im₀) + pos₂ → Re₁</text>
+<line x1="620" y1="147" x2="630" y2="147" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<line x1="755" y1="147" x2="765" y2="147" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="495" y="200" width="125" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="557.5" y="218.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">…</text>
+<text x="557.5" y="233.7" font-size="11" text-anchor="middle" fill="#1f2328">steps 3 to 13</text>
+<rect x="630" y="200" width="125" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="692.5" y="218.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step 14</text>
+<text x="692.5" y="233.7" font-size="11" text-anchor="middle" fill="#1f2328">E_im⁶(Im₆) + pos₁₄ → Re₇</text>
+<rect x="765" y="200" width="125" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="827.5" y="218.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">step 15</text>
+<text x="827.5" y="233.7" font-size="11" text-anchor="middle" fill="#1f2328">E_re⁷(Re₇) + pos₁₅ → Im₇</text>
+<polyline points="827.5,169 827.5,185 557.5,185 557.5,200" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<line x1="620" y1="222" x2="630" y2="222" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<line x1="755" y1="222" x2="765" y2="222" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<text x="495" y="275" font-size="11" text-anchor="start" fill="#6b7075">Same 1-layer transformer, causal over 16 steps; Im_i is conditioned on Re_i.</text>
+<text x="495" y="293" font-size="11" text-anchor="start" fill="#6b7075">Separate tables per stream and codebook: 8 Re tables, 7 Im tables</text>
+<text x="495" y="311" font-size="11" text-anchor="start" fill="#6b7075">(Im₇ is never fed back). Learned embedding per chain position.</text>
+<text x="495" y="329" font-size="11" text-anchor="start" fill="#6b7075">Logits layout identical to the 8-step head: decoding and losses are shared.</text>
+<rect x="920" y="90" width="400" height="300" rx="6" fill="none" stroke="#6b7075" stroke-width="0.8" stroke-dasharray="3 3"/>
+<text x="1312" y="105" font-size="11.5" font-weight="600" text-anchor="end" fill="#6b7075" letter-spacing="0.4">latent head (optional, any version)</text>
+<rect x="940" y="125" width="150" height="44" rx="4" fill="#dbe7f3" stroke="#3b6ea5" stroke-width="1.1"/>
+<text x="1015.0" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">RMSNorm</text>
+<text x="1015.0" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">→ Linear 1024 → 128</text>
+<rect x="1120" y="125" width="180" height="44" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="1210.0" y="143.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">split ẑ_re, ẑ_im (64-d)</text>
+<text x="1210.0" y="158.7" font-size="11" text-anchor="middle" fill="#1f2328">unit-norm 8-d chunks</text>
+<rect x="1040" y="200" width="170" height="44" rx="4" fill="#e9e8e4" stroke="#8a8f94" stroke-width="1.1"/>
+<text x="1125.0" y="218.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">MedITok decoder</text>
+<text x="1125.0" y="233.7" font-size="11" text-anchor="middle" fill="#1f2328">no quantiser (Panel B)</text>
+<line x1="1090" y1="147" x2="1120" y2="147" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<polyline points="1210,169 1210,185 1125,185 1125,200" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<text x="940" y="275" font-size="11" text-anchor="start" fill="#6b7075">A linear readout of the same hidden state; it predicts the</text>
+<text x="940" y="293" font-size="11" text-anchor="start" fill="#6b7075">continuous latent directly (the conditional mean), in one pass.</text>
+<text x="940" y="311" font-size="11" text-anchor="start" fill="#6b7075">Loss: L2 on unit-norm chunks, weight λ = 5, next to the token CE.</text>
+<text x="940" y="329" font-size="11" text-anchor="start" fill="#6b7075">Trained with the token head; either path is used at inference.</text>
+<polyline points="170,40 1015,40 1015,125" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="587.8" y="26.0" width="24.5" height="15" fill="#fbfaf7"/><text x="600" y="36" font-size="11" text-anchor="middle" fill="#1f2328">h_p</text>
+<text x="20" y="415" font-size="12" text-anchor="start" fill="#1f2328" font-weight="600">decoding (per position, then the whole image) → per-coil DC</text>
+<rect x="20" y="440" width="200" height="54" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="120.0" y="456.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">greedy</text>
+<text x="120.0" y="471.2" font-size="11" text-anchor="middle" fill="#1f2328">argmax IDs → codebook rows</text>
+<text x="120.0" y="486.2" font-size="11" text-anchor="middle" fill="#1f2328">→ decoder</text>
+<rect x="250" y="440" width="240" height="54" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="370.0" y="456.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">posterior sampling (PS)</text>
+<text x="370.0" y="471.2" font-size="11" text-anchor="middle" fill="#1f2328">n sampled draws (top-k) → decoder</text>
+<text x="370.0" y="486.2" font-size="11" text-anchor="middle" fill="#1f2328">→ mean of the magnitudes</text>
+<rect x="520" y="440" width="240" height="54" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="640.0" y="456.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">expected embedding</text>
+<text x="640.0" y="471.2" font-size="11" text-anchor="middle" fill="#1f2328">softmax-weighted codebook rows</text>
+<text x="640.0" y="486.2" font-size="11" text-anchor="middle" fill="#1f2328">→ decoder, no sampling</text>
+<rect x="790" y="440" width="200" height="54" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="890.0" y="456.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">latent path</text>
+<text x="890.0" y="471.2" font-size="11" text-anchor="middle" fill="#1f2328">ẑ → decoder (Panel B)</text>
+<text x="890.0" y="486.2" font-size="11" text-anchor="middle" fill="#1f2328">one pass</text>
+<rect x="1050" y="440" width="270" height="54" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1" stroke-dasharray="5 3"/>
+<text x="1185.0" y="456.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">↓2 to 256², expand S_c · x̂,</text>
+<text x="1185.0" y="471.2" font-size="11" text-anchor="middle" fill="#1f2328">per-coil DC on the measured lines</text>
+<text x="1185.0" y="486.2" font-size="11" text-anchor="middle" fill="#1f2328">(inference only)</text>
+<polyline points="460,390 460,400 120,400 120,440" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<polyline points="370,400 370,440" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<polyline points="640,400 640,440" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<polyline points="460,400 640,400" fill="none" stroke="#1f2328" stroke-width="1.1"/>
+<text x="480" y="397" font-size="11" text-anchor="start" fill="#6b7075">token logits from either token head</text>
+<polyline points="1125,390 1125,400 890,400 890,440" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="993.9" y="386.0" width="12.2" height="15" fill="#fbfaf7"/><text x="1000" y="396" font-size="11" text-anchor="middle" fill="#1f2328">ẑ</text>
+<polyline points="220,480 235,480 235,514 1185,514 1185,494" fill="none" stroke="#6b7075" stroke-width="1.1" marker-end="url(#ahm)"/>
+<polyline points="490,480 502,480 502,514" fill="none" stroke="#6b7075" stroke-width="1.1"/>
+<polyline points="760,480 772,480 772,514" fill="none" stroke="#6b7075" stroke-width="1.1"/>
+<polyline points="990,480 1002,480 1002,514" fill="none" stroke="#6b7075" stroke-width="1.1"/>
+<text x="20" y="545" font-size="11" text-anchor="start" fill="#6b7075" font-style="italic">Training loss: cross-entropy over the 16 codes of every position (teacher-forced) + λ · L2 of the latent head. No DC in training.</text>
+<text x="20" y="565" font-size="11" text-anchor="start" fill="#6b7075" font-style="italic">Results (suno, x8, 256 grid, vs SENSE): v2.1 token head greedy 30.47, PS8 30.98; v2.1 + latent head, latent path 31.27 dB in one pass.</text>
+</svg>

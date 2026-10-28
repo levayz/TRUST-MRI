@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 360" width="1320" height="360" font-family="'IBM Plex Sans', system-ui, sans-serif" style="background:#fbfaf7;color:#1f2328">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/></marker><marker id="ahm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6b7075"/></marker></defs>
+<rect x="20" y="110" width="160" height="58" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="100.0" y="128.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">undersampled k-space</text>
+<text x="100.0" y="143.2" font-size="11" text-anchor="middle" fill="#1f2328">y, C coils, mask M</text>
+<text x="100.0" y="158.2" font-size="11" text-anchor="middle" fill="#1f2328">R = 8, 10 ACS lines</text>
+<rect x="200" y="110" width="160" height="58" rx="4" fill="#dbe7f3" stroke="#3b6ea5" stroke-width="1.1"/>
+<text x="280.0" y="128.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">sensitivity net</text>
+<text x="280.0" y="143.2" font-size="11" text-anchor="middle" fill="#1f2328">U-Net on the ACS lines</text>
+<text x="280.0" y="158.2" font-size="11" text-anchor="middle" fill="#1f2328">→ maps S</text>
+<rect x="380" y="110" width="160" height="58" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1"/>
+<text x="460.0" y="128.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">SENSE combine</text>
+<text x="460.0" y="143.2" font-size="11" text-anchor="middle" fill="#1f2328">x_zf = Σ S*·F⁻¹y / Σ|S|²</text>
+<text x="460.0" y="158.2" font-size="11" text-anchor="middle" fill="#1f2328">256 × 256, complex</text>
+<rect x="560" y="110" width="160" height="58" rx="4" fill="#e9e8e4" stroke="#8a8f94" stroke-width="1.1"/>
+<text x="640.0" y="128.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">MedITok encoder</text>
+<text x="640.0" y="143.2" font-size="11" text-anchor="middle" fill="#1f2328">frozen, Panel B</text>
+<text x="640.0" y="158.2" font-size="11" text-anchor="middle" fill="#1f2328">Re and Im separately</text>
+<rect x="740" y="110" width="160" height="58" rx="4" fill="#dbe7f3" stroke="#3b6ea5" stroke-width="1.1"/>
+<text x="820.0" y="128.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">GPT-L body + heads</text>
+<text x="820.0" y="143.2" font-size="11" text-anchor="middle" fill="#1f2328">Panels C, D</text>
+<text x="820.0" y="158.2" font-size="11" text-anchor="middle" fill="#1f2328">426 M, trainable</text>
+<rect x="920" y="110" width="160" height="58" rx="4" fill="#e9e8e4" stroke="#8a8f94" stroke-width="1.1"/>
+<text x="1000.0" y="135.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">MedITok decoder</text>
+<text x="1000.0" y="150.7" font-size="11" text-anchor="middle" fill="#1f2328">frozen, Panel B</text>
+<rect x="1100" y="110" width="185" height="58" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1" stroke-dasharray="5 3"/>
+<text x="1192.5" y="128.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">expand x̂_c = S_c · x̂</text>
+<text x="1192.5" y="143.2" font-size="11" text-anchor="middle" fill="#1f2328">per-coil DC on the</text>
+<text x="1192.5" y="158.2" font-size="11" text-anchor="middle" fill="#1f2328">measured lines</text>
+<line x1="180" y1="139.0" x2="200" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="183.9" y="123.0" width="12.2" height="15" fill="#fbfaf7"/><text x="190.0" y="133.0" font-size="11" text-anchor="middle" fill="#1f2328">y</text>
+<line x1="360" y1="139.0" x2="380" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="354.7" y="123.0" width="30.6" height="15" fill="#fbfaf7"/><text x="370.0" y="133.0" font-size="11" text-anchor="middle" fill="#1f2328">S, y</text>
+<line x1="540" y1="139.0" x2="560" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="500.8" y="120.0" width="98.4" height="15" fill="#fbfaf7"/><text x="550.0" y="130.0" font-size="11" text-anchor="middle" fill="#1f2328">x_zf, ↑2 → 512²</text>
+<line x1="720" y1="139.0" x2="740" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="696.2" y="120.0" width="67.6" height="15" fill="#fbfaf7"/><text x="730.0" y="130.0" font-size="11" text-anchor="middle" fill="#1f2328">z_re, z_im</text>
+<text x="725" y="161.0" font-size="10.5" text-anchor="middle" fill="#1f2328">32×32×64 each</text>
+<line x1="900" y1="139.0" x2="920" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="882.4" y="123.0" width="55.3" height="15" fill="#fbfaf7"/><text x="910.0" y="133.0" font-size="11" text-anchor="middle" fill="#1f2328">IDs or ẑ</text>
+<line x1="1080" y1="139.0" x2="1100" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="1047.0" y="120.0" width="86.1" height="15" fill="#fbfaf7"/><text x="1090.0" y="130.0" font-size="11" text-anchor="middle" fill="#1f2328">x̂, ↓2 → 256²</text>
+<line x1="1285" y1="139.0" x2="1305" y2="139.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<text x="1308" y="143.0" font-size="13" text-anchor="start" fill="#1f2328" font-style="italic">x̂</text>
+<polyline points="240,110 240,80 1140,80 1140,110" fill="none" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="319.2" y="66.0" width="221.6" height="15" fill="#fbfaf7"/><text x="430" y="76" font-size="11" text-anchor="middle" fill="#1f2328">S (maps) also used by expand and DC</text>
+<line x1="785" y1="30" x2="785" y2="110" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="714.2" y="14.0" width="141.5" height="15" fill="#fbfaf7"/><text x="785" y="24" font-size="11" text-anchor="middle" fill="#1f2328">mask M (column vector)</text>
+<line x1="855" y1="50" x2="855" y2="110" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="821.2" y="34.0" width="67.6" height="15" fill="#fbfaf7"/><text x="855" y="44" font-size="11" text-anchor="middle" fill="#1f2328">timestep t</text>
+<rect x="20" y="240" width="160" height="58" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1" stroke-dasharray="5 3"/>
+<text x="100.0" y="265.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">fully sampled k-space</text>
+<text x="100.0" y="280.7" font-size="11" text-anchor="middle" fill="#1f2328">training only</text>
+<rect x="200" y="240" width="180" height="58" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1" stroke-dasharray="5 3"/>
+<text x="290.0" y="258.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">oracle maps (ESPIRiT)</text>
+<text x="290.0" y="273.2" font-size="11" text-anchor="middle" fill="#1f2328">→ SENSE target x₀</text>
+<text x="290.0" y="288.2" font-size="11" text-anchor="middle" fill="#1f2328">256 × 256, complex</text>
+<rect x="560" y="240" width="160" height="58" rx="4" fill="#e9e8e4" stroke="#8a8f94" stroke-width="1.1"/>
+<text x="640.0" y="265.7" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">MedITok encoder</text>
+<text x="640.0" y="280.7" font-size="11" text-anchor="middle" fill="#1f2328">frozen</text>
+<rect x="740" y="240" width="160" height="58" rx="4" fill="#fbfaf7" stroke="#1f2328" stroke-width="1.1" stroke-dasharray="5 3"/>
+<text x="820.0" y="258.2" font-size="12" text-anchor="middle" fill="#1f2328" font-weight="600">training targets</text>
+<text x="820.0" y="273.2" font-size="11" text-anchor="middle" fill="#1f2328">token IDs → CE loss</text>
+<text x="820.0" y="288.2" font-size="11" text-anchor="middle" fill="#1f2328">latents z₀ → L2 loss</text>
+<line x1="180" y1="269.0" x2="200" y2="269.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<line x1="380" y1="269.0" x2="560" y2="269.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="427.0" y="253.0" width="86.1" height="15" fill="#fbfaf7"/><text x="470.0" y="263.0" font-size="11" text-anchor="middle" fill="#1f2328">x₀, ↑2 → 512²</text>
+<line x1="720" y1="269.0" x2="740" y2="269.0" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="702.4" y="253.0" width="55.3" height="15" fill="#fbfaf7"/><text x="730.0" y="263.0" font-size="11" text-anchor="middle" fill="#1f2328">z₀ / IDs</text>
+<line x1="815" y1="240" x2="815" y2="168" stroke="#1f2328" stroke-width="1.1" marker-end="url(#ah)"/>
+<rect x="827.0" y="198.0" width="30.6" height="15" fill="#fbfaf7"/><text x="830" y="208.0" font-size="11" text-anchor="start" fill="#1f2328">loss</text>
+<text x="20" y="335" font-size="11" text-anchor="start" fill="#6b7075" font-style="italic">Solid boxes: inference path. Dashed boxes: training only. DC is applied only at inference.</text>
+</svg>
