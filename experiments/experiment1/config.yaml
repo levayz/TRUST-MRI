@@ -1,0 +1,75 @@
+datasets: [brain, knee]
+accelerations: [8, 16]
+methods: [LES, GEO, TDS]
+
+# Slice selection
+num_slices_normal: 100         # 1 center slice per scan × 100 scans
+num_slices_heavy: 100
+slice_selection: center_out
+seed: 42
+
+# TDS acquisition defaults (overridable via CLI --tds_* flags)
+tds_defaults:
+  distance: js                        # js | symmetric_kl | topk_l1
+  foreground_mode: percentile         # none | threshold | percentile | top_m_entropy_foreground
+  foreground_threshold: 0.0
+  foreground_percentile: 20           # bottom 20% magnitude excluded
+  top_m: 64                           # patches for top_m_entropy_foreground mode
+  alpha: 1.0                          # weight on TDS score
+  beta: 0.0                           # weight on entropy-reduction (0 = plain TDS)
+  candidate_mode: all                 # all | geo_topk
+  candidate_k: 16                     # shortlist size for geo_topk
+  entropy_normalization: true
+  line_aggregation: sum               # sum | mean
+  candidate_batch_size: 16            # candidates per model forward pass
+
+# Active sampling
+center_fraction: 0.04
+rank: 1                        # lines acquired per step
+far_n_steps: 1                 # FAR generation steps (1 = single-pass: masked image → full recon)
+
+# Candidate-line analysis
+candidate_lines_per_step: 32   # null = ALL unsampled lines; 32 gives reliable Spearman at ~8x speedup
+candidate_steps: [early, middle, late]
+
+# Oracle
+oracle_objectives: [mse, ssfd, token_acc]
+
+# Run switches
+run_normal_trajectory: true
+run_candidate_counterfactuals: true
+run_full_greedy_oracle: true
+
+# Storage
+batch_size_candidates: 32
+save_reconstructions: true
+save_token_probabilities: true   # saves top-64 compressed, not full probs
+save_logits: false
+save_dtype: float16
+top_k_probs: 64                  # number of top vocab entries to save per token
+
+# Checkpoint defaults (relative to TRUST-MRI root; override with --checkpoint CLI arg)
+checkpoints:
+  brain:
+    8:  checkpoints/brain/cart_1D/x8/best.pt
+    16: checkpoints/brain/cart_1D/x16/best.pt
+  knee:
+    8:  checkpoints/knee/cart_1D/x8/best.pt
+    16: checkpoints/knee/cart_1D/x16/best.pt
+
+# MedITok (singlecoil uses simple_v1)
+meditok_config: weights/meditok/config.json
+meditok_ckpt: weights/meditok/meditok_simple_v1.pth
+
+# Dataset paths (relative to TRUST-MRI root; override with --data_path CLI arg)
+data_paths:
+  brain: fastmri/brain/singlecoil_emulated_val
+  knee:  fastmri/knee/singlecoil_val
+
+# Split files (relative to TRUST-MRI root)
+# Generated with seed=42, 100 scans randomly chosen from each full val set.
+# fastmri/splits/exp1_brain_100scans.txt: 100/460 brain val scans
+# fastmri/splits/exp1_knee_100scans.txt:  100/199 knee val scans
+split_files:
+  brain: fastmri/splits/exp1_brain_100scans.txt
+  knee:  fastmri/splits/exp1_knee_100scans.txt
