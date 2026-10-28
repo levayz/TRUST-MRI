@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CUDA_VISIBLE_DEVICES=5
 
-CHECKPOINT="results_multicoil/brain/x8/run1/0075000.pt"
+CHECKPOINT="/fast/lev/TRUST-MRI/results_multicoil/brain/x8/run3_8_coils/0047000_best_psnr.pt"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -25,6 +26,7 @@ CENTER_FRACTIONS=0.04
 ACCELERATION=8
 CROP_SIZE=256
 N_VIS_SCANS=4       # center-slice images saved per eval run (0 = disabled)
+N_VCC_COILS=""      # override n_virtual_coils from checkpoint (leave empty to use ckpt value)
 
 # ---------------------------------------------------------------------------
 # Run
@@ -32,6 +34,11 @@ N_VIS_SCANS=4       # center-slice images saved per eval run (0 = disabled)
 SPLIT_ARGS=""
 if [ -n "${DATA_SPLIT}" ]; then
     SPLIT_ARGS="--split_file ${DATA_SPLIT}"
+fi
+
+VCC_ARGS=""
+if [ -n "${N_VCC_COILS}" ]; then
+    VCC_ARGS="--n_virtual_coils ${N_VCC_COILS}"
 fi
 
 python eval_multicoil.py \
@@ -47,6 +54,7 @@ python eval_multicoil.py \
     --num_workers       4                      \
     --n_vis_scans       "${N_VIS_SCANS}"       \
     ${SPLIT_ARGS}                              \
+    ${VCC_ARGS}                                \
     "$@"
 
 echo "Results written to: ${OUTPUT_DIR}"

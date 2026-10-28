@@ -219,7 +219,7 @@ class SliceMRICodeDataset(Dataset):
 
             if self.mask_func:
                 seed = None if not self.use_seed else tuple(map(ord, pathlib.Path(fname).name))
-                masked_kspace, mask, _ = transforms.apply_mask(kspace_resized, self.mask_func, seed)
+                masked_kspace, mask, _ = transforms.apply_mask(kspace_resized, self.mask_func, seed=seed)
                 if mask.dim() == 4:   # 2D point mask [1, H, W, 1] → [H, W, 1]
                     mask = mask.squeeze(0)
                 else:                 # 1D column mask [1, W, 1] → [H, W, 1]

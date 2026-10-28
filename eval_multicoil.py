@@ -149,6 +149,8 @@ def parse_args():
                    help="max volumes to save as H5 (0 = all scans)")
     p.add_argument("--save_per_coil",   action="store_true",
                    help="Save per-coil re/im images for the first scan")
+    p.add_argument("--n_virtual_coils", type=int, default=None,
+                   help="Override the number of virtual coils from the checkpoint")
 
     return p.parse_args()
 
@@ -172,7 +174,8 @@ def main():
 
     # Pull training settings; fall back to eval-script args where absent
     ck_max_coils      = getattr(ckpt_args, "max_coils",      args.crop_size // 64)
-    ck_n_virt         = getattr(ckpt_args, "n_virtual_coils", 8)
+    ck_n_virt         = args.n_virtual_coils if args.n_virtual_coils is not None \
+                        else getattr(ckpt_args, "n_virtual_coils", 8)
     ck_vcc_dir_val    = getattr(ckpt_args, "vcc_matrix_dir_val", None) \
                         or getattr(ckpt_args, "vcc_matrix_dir", None)
     ck_simple         = getattr(ckpt_args, "simple",          False)

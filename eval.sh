@@ -2,23 +2,18 @@
 set -euo pipefail
 
 export PYTHONPATH="$(pwd)"
-export CUDA_VISIBLE_DEVICES="2"
+GPUS=(6)
 
 # ── Checkpoints, accelerations, organs ───────────────────────────────────────
 # Add one entry per run; arrays must be the same length.
 CKPTS=(
-  # "/fast/lev/TRUST-MRI/results/debug/best.pt"
-  "/fast/lev/TRUST-MRI/results/knee/vds2d/run1_GPT-L/cf_0.04/acc_400/checkpoints/best.pt"
+  # "checkpoints/brain/cart_1D/x8/best.pt"
+  # "checkpoints/brain/cart_1D/x16/best.pt"
+  "checkpoints/knee/cart_1D/x8/best.pt"
+  # "checkpoints/knee/cart_1D/x16/best.pt"
 )
-ACCS=(
-  # 8
-  # 16
-  400
-)
-ORGANS=(
-  knee
-  # brain
-)
+ACCS=(8)
+ORGANS=(knee)
 
 # ── Per-organ data config ─────────────────────────────────────────────────────
 get_data_config() {
@@ -26,14 +21,15 @@ get_data_config() {
   case $organ in
     brain)
       DATA_ROOT="fastmri/brain/singlecoil_emulated_all"
-      DATA_SPLIT="fastmri/splits/multicoil_brain_test.txt"
+      # DATA_SPLIT="fastmri/splits/multicoil_brain_test.txt"
+      DATA_SPLIT="fastmri/splits/suno_brain_test.txt"
       IMG_SIZE=256
       COND_TOKENS=256
       ;;
     knee)
       DATA_ROOT="fastmri/knee/singlecoil_val"
-      DATA_SPLIT="fastmri/splits/adasense_test_split.txt"
-      # DATA_SPLIT="fastmri/splits/full_knee_val_split.txt"
+      # DATA_SPLIT="fastmri/splits/adasense_test_split.txt"
+      DATA_SPLIT="fastmri/splits/full_knee_val_split.txt"
       IMG_SIZE=320
       COND_TOKENS=400
       ;;
@@ -72,14 +68,14 @@ TOPK=0
 NUM_CLASSES=8
 BATCH_SIZE=4
 GPT_MODEL="GPT-L"
-MASK_TYPE="vds2d"  # 1D Cartesian: cart_1d | equispaced    2D: vds2d | poisson
+MASK_TYPE="cart_1d"  # 1D Cartesian: cart_1d | equispaced    2D: vds2d | poisson
 
 # Derive mask flags from MASK_TYPE
 case $MASK_TYPE in
   cart_1d|equispaced)
     MASK_LABEL="cart_1d"
     INITIAL_MASK_ARGS=()
-    AS_MASK_TYPE="1d"
+    AS_MASK_TYPE="cartesian"
     AS_MASK_EXTRA_ARGS=()
     ;;
   vds2d)
@@ -140,11 +136,15 @@ run_variant() {
     "$@"
 }
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Main loop — launch all jobs in parallel, each on its own GPU ──────────────
+PIDS=()
+LABELS=()
+
 for i in "${!CKPTS[@]}"; do
   CKPT="${CKPTS[$i]}"
   ACC="${ACCS[$i]}"
   ORGAN="${ORGANS[$i]}"
+  GPU="${GPUS[$i]}"
   BASE_OUTDIR="$(dirname "$(dirname "$CKPT")")/eval"
 
   get_data_config "$ORGAN"
@@ -158,30 +158,37 @@ for i in "${!CKPTS[@]}"; do
     V_PREFIX="cf_${CF}_acc_${ACC}_iter_${ITER}_"
   fi
 
-  # Pick step count based on mask dimensionality
-  if [[ "$AS_MASK_TYPE" == "1d" ]]; then
+  if [[ "$AS_MASK_TYPE" == "cartesian" ]]; then
     N_STEPS="$AS_STEPS"
   else
     N_STEPS="$AS_STEPS_2D"
   fi
 
-  echo "==> [$((i+1))/${#CKPTS[@]}] organ=$ORGAN  mask=$MASK_LABEL  acc=$ACC  as_steps=$N_STEPS"
+  LABEL="${ORGAN}_x${ACC}"
+  echo "  [$(date +%H:%M:%S)]  GPU ${GPU}  ${LABEL}  as_steps=${N_STEPS}"
 
-  # Plain reconstruction (no active sampling)
-  # run_variant "$BASE_OUTDIR" "$CKPT" "$ACC" "$ORGAN" "${V_PREFIX}val_${MASK_LABEL}_plain" \
-  #   "${INITIAL_MASK_ARGS[@]}"
+  LOGFILE="${BASE_OUTDIR}/${V_PREFIX}val_${MASK_LABEL}_random_fullval.log"
+  mkdir -p "$(dirname "$LOGFILE")"
 
-  # # LES — Latent Entropy Selection
-  # run_variant "$BASE_OUTDIR" "$CKPT" "$ACC" "$ORGAN" "${V_PREFIX}val_${MASK_LABEL}_LES_${N_STEPS}step" \
-  #   "${INITIAL_MASK_ARGS[@]}" \
-  #   --active-sampling --active-sampling-steps "$N_STEPS" \
-  #   --active-sampling-fn "patch_logits" --active-sampling-mask-type "$AS_MASK_TYPE" \
-  #   "${AS_MASK_EXTRA_ARGS[@]}"
-
-  # GEO — Gradient-based Entropy Optimization
-  run_variant "$BASE_OUTDIR" "$CKPT" "$ACC" "$ORGAN" "${V_PREFIX}val_${MASK_LABEL}_GEO_${N_STEPS}step" \
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  run_variant "$BASE_OUTDIR" "$CKPT" "$ACC" "$ORGAN" "${V_PREFIX}val_${MASK_LABEL}_random_fullval" \
     "${INITIAL_MASK_ARGS[@]}" \
-    --active-sampling --active-sampling-steps "$N_STEPS" \
-    --active-sampling-fn "gradient" --active-sampling-mask-type "$AS_MASK_TYPE" \
-    "${AS_MASK_EXTRA_ARGS[@]}"
+    >"${LOGFILE}" 2>&1 &
+
+  PIDS+=($!)
+  LABELS+=("${LABEL}")
 done
+
+echo ""
+echo "Waiting for all jobs..."
+FAILED=0
+for i in "${!PIDS[@]}"; do
+  if wait "${PIDS[$i]}"; then
+    echo "  ✓  ${LABELS[$i]}"
+  else
+    echo "  ✗  ${LABELS[$i]}" >&2
+    FAILED=1
+  fi
+done
+(( FAILED == 0 )) || exit 1
+echo "All done."

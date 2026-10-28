@@ -4,8 +4,8 @@ set -euo pipefail
 export PYTHONPATH="$(pwd)"
 
 # ── GPU / port ────────────────────────────────────────────────────────────────
-export CUDA_VISIBLE_DEVICES="1,2"
-MASTER_PORT=29505
+export CUDA_VISIBLE_DEVICES="1"
+MASTER_PORT=29501
 # ── Dataset: choose "knee" or "brain" ────────────────────────────────────────
 ORGAN="knee"
 
@@ -46,7 +46,7 @@ case $MASK_TYPE in
 esac
 RESULT_DIR="${RESULT_DIR}/${MASK_LABEL}"
 
-torchrun --nproc_per_node=2 --master_port=$MASTER_PORT \
+torchrun --nproc_per_node=1 --master_port=$MASTER_PORT \
   autoregressive/train/train.py \
   --exp-name "run1_${GPT_MODEL}/cf_${CF}/acc_${ACC// /_}" \
   --results-dir "$RESULT_DIR" \
@@ -68,10 +68,11 @@ torchrun --nproc_per_node=2 --master_port=$MASTER_PORT \
   --center-fractions ${CF} \
   --accelerations ${ACC} \
   --mask-type "$MASK_TYPE" \
+  --vds-acs-fraction 0.025 \
   --far-mask-mode radial \
   --complex-mode cartesian \
   --global-batch-size "$BATCH_SIZE" \
-  --num-workers 4 \
+  --num-workers 0 \
   --lr 1e-4 \
   --epochs 200 \
   --log-every 100 \
@@ -84,4 +85,4 @@ torchrun --nproc_per_node=2 --master_port=$MASTER_PORT \
   --encode-gt \
   --no-compile \
   --val-save-viz \
-  --val-n-scans-to-save 2
+  --val-n-scans-to-save 4

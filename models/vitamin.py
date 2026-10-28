@@ -355,6 +355,7 @@ class GeGluMlp(nn.Module):
         hidden_features,
         act_layer = None,
         drop = 0.0,
+        **kwargs,
     ):
         super().__init__()
         norm_layer = partial(get_norm_layer('layernorm'), eps=1e-6)
@@ -385,6 +386,7 @@ class HybridEmbed(nn.Module):
         embed_dim=1024,
         bias=True,
         dynamic_img_pad=False,
+        **kwargs,
     ):
         super().__init__()
         assert isinstance(backbone, nn.Module)
