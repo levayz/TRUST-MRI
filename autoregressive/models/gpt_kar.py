@@ -98,6 +98,19 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
     vq_embed_path: str = None
+    latent_dim: int = 0  # >0: regression head predicting the tokenizer's continuous latent (Re+Im per position) next to the token head
+    draft_cond: bool = False  # second conditioning view for refinement: tokens of the previous (DC'd) reconstruction, added to the zero-filled view
+    model_version: float = 1  # 1: legacy GPT (prefix timestep token only; norm ~1 vs ~32 for the tokens -> invisible in practice)
+                            # 2: v1 + timestep conditioning (RMS-scaled embedding added to every conditioning token, gated, zero at timestep 0)
+                            #        + sampling-mask conditioning (mask column vector -> linear -> RMS-scaled -> gated -> added to every token)
+                            # 2.1: v2 + continuous input (tokenizer latents of Re|Im -> MLP, no input tokens) + interleaved Re/Im output head
+    mask_width: int = 256   # v2: width of the acquisition grid = length of the sampling-mask column vector
+    head_interleaved: bool = True   # v2.1 head: True = interleaved Re/Im chain (2K steps), False = parallel asymmetric head (K steps)
+    cont_in_dim: int = 64   # v2.1: width of the tokenizer's continuous latent per stream (the input is [Re latent, Im latent] -> MLP, no quantisation)
+    latent_head_type: str = 'linear'   # latent head: 'linear' = RMSNorm -> Linear; 'mlp' = + residual MLP on the same hidden state;
+                                       # 'fused' = + residual MLP on [hidden state, token head's chain state, codebook latents of the
+                                       # token head's greedy codes] (the latent head sees what the token head committed to)
+    latent_mlp_width: int = 0          # hidden width of the latent MLP (0 = 2 * dim)
 
     block_type: str = None # default self attn block, supports also complex
 
@@ -541,7 +554,7 @@ class AutoRegressiveHead(nn.Module):
 
         # concat along channel dimension TODO if concat then cant concat the base tokens
         # index_embeddings = torch.cat((index_embeddings_re, index_embeddings_im), dim=-1)  # [B*Li, K-1, 1536]
-        index_embeddings = index_embeddings_re + index_embeddings_im # TODO maybe something better, add NORM? conct and project back to 768?
+        index_embeddings = index_embeddings_re + index_embeddings_im # TODO maybe something better, add NORM followed by projection? conct and project back to 768?
         h = torch.cat((base_tokens, index_embeddings), dim=1)  # [B*(1+(Li-1)), 1+(K-1), 768]
         for layer in self.layers:
             h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)
@@ -554,7 +567,7 @@ class AutoRegressiveHead(nn.Module):
         logits = torch.stack((logits_re, logits_im), dim=1)  # [B, 2, 1+(K-1), 1+(Li-1), V/K]
         return logits
 
-    def forward_test(self, base_tokens, idx=None, input_pos=None, mask=None):
+    def forward_test(self, base_tokens, idx=None, input_pos=None, mask=None, return_state=False):
         if idx is not None:
             re_idx = idx[:,0]
             im_idx = idx[:,1]
@@ -572,7 +585,24 @@ class AutoRegressiveHead(nn.Module):
         logits_im = self.linear_head_im(h)  # [B*(1+(Li-1)), 1, V/K]. Next codebook prediction
 
         logits = torch.stack((logits_re, logits_im), dim=1)  # [B*L, 2, 1, V/K] here K=1 because of KV cache
-        return logits
+        return (logits, h) if return_state else logits
+
+    @torch.no_grad()
+    def rollout(self, base):
+        """Greedy roll-out without KV caches (training-time use). base (N, C) -> codes (N, 2, K) long and the chain state (N, C):
+        the mean over the K chain steps of the normalised hidden state (the quantity forward_test returns with return_state=True)."""
+        K = self.num_codebooks
+        xs, re, im, states = [base], [], [], []
+        for s in range(K):
+            h = torch.stack(xs, dim=1)
+            for layer in self.layers:
+                h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)
+            h = self.norm(h)[:, -1]
+            states.append(h)
+            re.append(self.linear_head_re(h).argmax(-1)); im.append(self.linear_head_im(h).argmax(-1))
+            if s < K - 1:
+                xs.append(self.codebooks[s](re[-1]) + self.codebooks[s](im[-1]))
+        return torch.stack([torch.stack(re, 1), torch.stack(im, 1)], dim=1), torch.stack(states, 1).float().mean(1)
 
 
 class Transformer(nn.Module):
@@ -587,6 +617,7 @@ class Transformer(nn.Module):
         self.num_codebooks = config.num_codebooks
         self.cls_token_num = config.cls_token_num # this is for the timestep embedding tokens
         self.cond_token_num = config.cond_token_num
+        self.model_version = float(getattr(config, 'model_version', 1) or 1)
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
         elif self.model_type == 't2i':
@@ -601,6 +632,11 @@ class Transformer(nn.Module):
             print(f"Loading embeddings from: {vq_embed_path}")
             missing_keys, unexpected_keys = self.tok_embeddings.load_state_dict(load_unitok_embeddings(vq_embed_path), strict=False)
             print(f"---missing keys: {missing_keys}\n---unexpected keys: {unexpected_keys}")
+        elif self.model_version >= 2.1:
+            # v2.1 input: the tokenizer's continuous Re / Im latents (unit-norm codebook chunks), concatenated along the channel
+            # dimension and projected by an MLP; the quantiser is skipped on the input side
+            self.cont_in_dim = int(getattr(config, 'cont_in_dim', 64))
+            self.in_proj = nn.Sequential(nn.Linear(2 * self.cont_in_dim, config.dim), nn.GELU(), nn.Linear(config.dim, config.dim))
         else:
             # self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
             self.re_tok_embeddings = TokenEmbedder(config.vocab_size, config.dim, config.num_codebooks) 
@@ -623,7 +659,40 @@ class Transformer(nn.Module):
 
         # output layer
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = AutoRegressiveHead(config)
+        if self.model_version >= 2.1:
+            self.output = AutoRegressiveHeadInterleaved(config) if getattr(config, 'head_interleaved', True) else AutoRegressiveHeadAsym(config)
+        else:
+            self.output = AutoRegressiveHead(config)
+        self.latent_dim = int(getattr(config, 'latent_dim', 0) or 0)
+        self.latent_head = (nn.Sequential(RMSNorm(config.dim, eps=config.norm_eps), nn.Linear(config.dim, 2 * self.latent_dim))
+                            if self.latent_dim > 0 else None)
+        self.latent_head_type = str(getattr(config, 'latent_head_type', 'linear') or 'linear')
+        assert self.latent_head_type in ('linear', 'mlp', 'fused'), self.latent_head_type
+        self.latent_mlp = None
+        if self.latent_dim > 0 and self.latent_head_type != 'linear':
+            width = int(getattr(config, 'latent_mlp_width', 0) or 0) or 2 * config.dim
+            fused = self.latent_head_type == 'fused'
+            in_dim = config.dim + (config.dim + 2 * self.latent_dim if fused else 0)
+            # residual branch on the linear readout; its last layer is zero-initialised (initialize_weights) so a warm start from a
+            # linear-head checkpoint reproduces that model exactly at step 0
+            self.latent_mlp = nn.Sequential(nn.Linear(in_dim, width), nn.GELU(), nn.Linear(width, 2 * self.latent_dim))
+            if fused:
+                self.latent_fuse_ln = RMSNorm(config.dim, eps=config.norm_eps)
+                K = config.num_codebooks
+                # the tokenizer's codebook rows (K, V/K, d), set by set_latent_codebook; not part of the checkpoint
+                self.register_buffer('latent_codebook', torch.zeros(K, config.vocab_size // K, self.latent_dim // K), persistent=False)
+                self.latent_codebook_ready = False
+        if self.model_version >= 2:
+            # timestep conditioning (the additive vector is zero at timestep 0, so a warm-started pass 1 is unchanged)
+            self.t_gate = nn.Parameter(torch.full((1,), 0.5))
+            # sampling-mask conditioning
+            self.mask_width = int(config.mask_width)
+            self.mask_embed = nn.Linear(self.mask_width, config.dim)
+            self.m_gate = nn.Parameter(torch.full((1,), 0.5))
+        self.draft_cond = bool(getattr(config, 'draft_cond', False))
+        if self.draft_cond:   # two-view conditioning: zero-filled tokens + (gated) tokens of the previous reconstruction, same embedders
+            self.draft_ln = RMSNorm(config.dim, eps=config.norm_eps)
+            self.draft_gate = nn.Parameter(torch.full((1,), 0.5))
 
         # 2d rotary pos embedding
         grid_size = int(self.block_size ** 0.5)
@@ -647,6 +716,9 @@ class Transformer(nn.Module):
         # Zero-out output layers:
         nn.init.constant_(self.output.linear_head_re.weight, 0)
         nn.init.constant_(self.output.linear_head_im.weight, 0)
+        if getattr(self, 'latent_mlp', None) is not None:   # residual latent MLP starts as a no-op
+            nn.init.zeros_(self.latent_mlp[-1].weight)
+            nn.init.zeros_(self.latent_mlp[-1].bias)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -697,20 +769,40 @@ class Transformer(nn.Module):
 
     def forward(
             self,
-            cond_tokens: torch.Tensor,  # [B, 2, K, L]
+            cond_tokens: torch.Tensor = None,  # [B, 2, K, L] (model v1 input)
             soft_cond_embeddings: torch.Tensor = None, # used for STE [B,2,L,dim]
             timestep: torch.Tensor = None, 
             input_pos: Optional[torch.Tensor] = None,
             targets: Optional[torch.Tensor] = None, # [B, 2, K, L]
             mask: Optional[torch.Tensor] = None,
             valid: Optional[torch.Tensor] = None,
+            return_latent: bool = False,
+            draft_tokens: torch.Tensor = None,  # [B, 2, K, L] tokens of the previous reconstruction (refinement passes, --draft-cond)
+            sample_mask_cols: torch.Tensor = None,  # [B, W] sampling-mask columns of the acquisition grid (model v2)
+            cond_latent: torch.Tensor = None,  # [B, 2, L, Dz] continuous encoder latents of the input (model v2.1)
+            draft_latent: torch.Tensor = None,  # [B, 2, L, Dz] latents of the previous reconstruction (model v2.1 two-view refinement)
+            draft_keep: torch.Tensor = None,  # [B, L] progressive commitment: 1 = the draft view is committed at this position, 0 = no draft there
             **kwargs,
     ):
         assert self.cond_token_num > 0, "cond_token_num must be greater than 0"
-        cond_tokens_re = cond_tokens[:, 0, :, :]
-        cond_tokens_im = cond_tokens[:, 1, :, :]
-        cond_embed_re = self.re_tok_embeddings(cond_tokens_re)  # [B, Lc, dim]
-        cond_embed_im = self.im_tok_embeddings(cond_tokens_im)  # [B, Lc, dim]
+        if getattr(self, 'model_version', 1) >= 2.1:
+            assert cond_latent is not None, "model v2.1 takes continuous encoder latents: cond_latent (B, 2, L, D)"
+            w_dtype = self.in_proj[0].weight.dtype
+            z = torch.cat((cond_latent[:, 0], cond_latent[:, 1]), dim=-1).to(w_dtype)              # (B, L, 2D): Re | Im along channels
+            cond_embeddings = self.token_ln(self.in_proj(z))                                         # [B, Lc, dim]
+            if draft_latent is not None:
+                assert getattr(self, 'draft_cond', False), "draft_latent given but the model was built without draft_cond"
+                zd = torch.cat((draft_latent[:, 0], draft_latent[:, 1]), dim=-1).to(w_dtype)
+                d = self.draft_ln(self.in_proj(zd))
+                if draft_keep is not None:   # partial draft: dropped positions see the zero-filled view only
+                    d = d * draft_keep.to(d.dtype)[..., None]
+                cond_embeddings = cond_embeddings + (self.draft_gate.float() * d.float()).to(cond_embeddings.dtype)
+            cond_embed_re = cond_embed_im = None
+        else:
+            cond_tokens_re = cond_tokens[:, 0, :, :]
+            cond_tokens_im = cond_tokens[:, 1, :, :]
+            cond_embed_re = self.re_tok_embeddings(cond_tokens_re)  # [B, Lc, dim]
+            cond_embed_im = self.im_tok_embeddings(cond_tokens_im)  # [B, Lc, dim]
 
         if soft_cond_embeddings is not None:
             soft_cond_embed_re = soft_cond_embeddings[:, 0]
@@ -719,10 +811,30 @@ class Transformer(nn.Module):
             cond_embed_re = soft_cond_embed_re + (cond_embed_re - soft_cond_embed_re).detach()
             cond_embed_im = soft_cond_embed_im + (cond_embed_im - soft_cond_embed_im).detach()
         
-        cond_embeddings = self.token_ln(cond_embed_re + cond_embed_im) # [B, Lc, dim]
+        if cond_embed_re is not None:   # v1 token path
+            cond_embeddings = self.token_ln(cond_embed_re + cond_embed_im) # [B, Lc, dim]
+        if draft_tokens is not None:
+            assert getattr(self, 'draft_cond', False), "draft_tokens given but the model was built without draft_cond"
+            d = self.draft_ln(self.re_tok_embeddings(draft_tokens[:, 0]) + self.im_tok_embeddings(draft_tokens[:, 1]))   # [B, Lc, dim]
+            if draft_keep is not None:
+                d = d * draft_keep.to(d.dtype)[..., None]
+            cond_embeddings = cond_embeddings + (self.draft_gate.float() * d.float()).to(cond_embeddings.dtype)
+        if getattr(self, 'model_version', 1) >= 2:
+            assert sample_mask_cols is not None, "model v2 needs sample_mask_cols (B, W)"
+            assert sample_mask_cols.shape[-1] == self.mask_width, f"mask width {sample_mask_cols.shape[-1]} != model mask_width {self.mask_width}"
+            m_vec = self.mask_embed((2.0 * sample_mask_cols.float() - 1.0).to(self.mask_embed.weight.dtype)).float()   # (B, dim)
+            m_vec = F.normalize(m_vec, dim=-1) * (cond_embeddings.shape[-1] ** 0.5)                               # same RMS as the tokens
+            cond_embeddings = cond_embeddings + (self.m_gate.float() * m_vec)[:, None, :].to(cond_embeddings.dtype)
 
         if timestep is not None and self.cls_token_num > 0:
             t_embeddings = self.cls_embedding(timestep, train=self.training)[:, :self.cls_token_num]
+            if getattr(self, 'model_version', 1) >= 2:
+                # the prefix token alone is invisible (norm ~1 among 1024 tokens of norm ~32): also add the timestep embedding,
+                # rescaled to the tokens' RMS, to every conditioning position (gated, gate init 0)
+                # (no label dropout here; zero for timestep 0 so pass 1 of a warm-started model is bit-identical to before)
+                e_t = self.cls_embedding.embedding_table(timestep).float()                                   # (B, dim)
+                t_vec = F.normalize(e_t, dim=-1) * (cond_embeddings.shape[-1] ** 0.5) * (timestep > 0).float()[:, None]
+                cond_embeddings = cond_embeddings + (self.t_gate.float() * t_vec)[:, None, :].to(cond_embeddings.dtype)
             cond_embeddings = torch.cat([t_embeddings, cond_embeddings], dim=1) # [B, 1+Lm, dim]
 
         h = self.tok_dropout(cond_embeddings)
@@ -743,6 +855,13 @@ class Transformer(nn.Module):
             return h
         else:
             logits = self.output.forward_train(h, targets=targets)  # [B,2, 1+(K-1), 1+(Li-1), V/K]
+        latent = None
+        if return_latent and self.latent_head is not None:
+            if self.latent_head_type == 'fused':   # greedy roll-out of the token head (no grad): the codes the token path commits to
+                codes, state = self.rollout_head(h)
+                latent = self.predict_latent(h, head_state=state, head_codes=codes)
+            else:
+                latent = self.predict_latent(h)
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -758,10 +877,260 @@ class Transformer(nn.Module):
             loss_im = F.cross_entropy(logits[:, 1, :, :, :].reshape(-1, logits.size(-1)), targets[:, 1].reshape(-1))
             loss = (loss_re + loss_im) / 2
 
+        if return_latent:
+            return logits, loss, latent
         return logits, loss
+
+    def predict_latent(self, h: torch.Tensor, head_state: torch.Tensor = None, head_codes: torch.Tensor = None) -> torch.Tensor:
+        """h (B, L, dim) -> (B, 2, L, latent_dim): regressed tokenizer latent for the Re / Im streams, each 8-dim codebook
+        chunk L2-normalised (the decoder consumes unit-norm chunks; see models.sense_ops.latent_to_image).
+        'linear': RMSNorm -> Linear. 'mlp': + residual MLP on the same normalised hidden state. 'fused': + residual MLP on
+        [normalised hidden state, token head's chain state, codebook latents of the token head's codes]; head_state (B, L, dim)
+        and head_codes (B, 2, K, L) come from rollout_head (training) or from the sampler's cached head loop (inference)."""
+        hn = self.latent_head[0](h)
+        z = self.latent_head[1](hn).float()                              # (B, L, 2*D)
+        if self.latent_mlp is not None:
+            if self.latent_head_type == 'fused':
+                assert head_state is not None and head_codes is not None, "the fused latent head needs the token head's state and codes"
+                q = self.codes_to_latent(head_codes).to(hn.dtype)        # (B, 2, L, D): unit-norm codebook chunks of the committed codes
+                x = torch.cat([hn, self.latent_fuse_ln(head_state.to(hn.dtype)), q[:, 0], q[:, 1]], dim=-1)
+            else:
+                x = hn
+            z = z + self.latent_mlp(x).float()
+        B, L, _ = z.shape
+        z = z.view(B, L, 2, self.latent_dim).permute(0, 2, 1, 3)       # (B, 2, L, D)
+        nchunk = 8 if self.latent_dim % 8 == 0 else 1
+        z = F.normalize(z.reshape(B, 2, L, nchunk, -1), dim=-1).reshape(B, 2, L, self.latent_dim)
+        return z
+
+    @torch.no_grad()
+    def rollout_head(self, h: torch.Tensor):
+        """Greedy roll-out of the token head from the body's hidden states h (B, L, dim), without KV caches (training-time use;
+        the sampler's cached loop yields the same codes and states). Returns the codes (B, 2, K, L) the token path commits to and
+        the head's chain state (B, L, dim): the mean over the chain steps of its normalised hidden state."""
+        B, L, D = h.shape
+        codes, state = self.output.rollout(h.reshape(B * L, D))                         # (N, 2, K), (N, D)
+        return codes.view(B, L, 2, -1).permute(0, 2, 3, 1).contiguous(), state.view(B, L, D)
+
+    def set_latent_codebook(self, codebook):
+        """codebook: the tokenizer's product quantiser (models.quant.VectorQuantizerM) or a (K, V/K, d) tensor of unit-norm rows.
+        Stored as a non-persistent buffer (it belongs to the tokenizer, not to the checkpoint); needed by the fused latent head."""
+        cb = codebook if torch.is_tensor(codebook) else codebook_from_quantizer(codebook)
+        assert tuple(cb.shape) == tuple(self.latent_codebook.shape), f"codebook {tuple(cb.shape)} != {tuple(self.latent_codebook.shape)}"
+        self.latent_codebook.copy_(cb.to(self.latent_codebook.dtype))
+        self.latent_codebook_ready = True
+
+    def codes_to_latent(self, codes: torch.Tensor) -> torch.Tensor:
+        """codes (B, 2, K, L) -> (B, 2, L, K*d): the tokenizer's codebook rows of the codes (what quantizer.idx_to_f returns)."""
+        assert getattr(self, 'latent_codebook_ready', False), "call set_latent_codebook(tokenizer.quantizer) first"
+        return torch.cat([self.latent_codebook[k][codes[:, :, k]] for k in range(codes.shape[2])], dim=-1)
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
+
+
+
+class AutoRegressiveHeadInterleaved(nn.Module):
+    """Model-v2.1 output head. Per position one causal chain of 2K steps: step 2i predicts the Re code of codebook i, step 2i+1
+    the Im code of codebook i (conditioned on Re_i and on all earlier codes). Each (stream, codebook) has its own embedding
+    table and every chain step has a learned position embedding (even = Re, odd = Im), so the stream identity is explicit."""
+    interleaved = True
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_codebooks = K = config.num_codebooks
+        self.sub_vocab_size = V = config.vocab_size // K
+        self.codebooks_re = nn.ModuleList([nn.Embedding(V, config.dim) for _ in range(K)])        # re_i is the input of step 2i+1
+        self.codebooks_im = nn.ModuleList([nn.Embedding(V, config.dim) for _ in range(K - 1)])    # im_i is the input of step 2i+2
+        self.pos_emb = nn.Parameter(torch.zeros(2 * K, config.dim))
+        config_clone = copy.deepcopy(config)
+        self.layers = torch.nn.ModuleList([TransformerBlock(config_clone, drop_path=0.) for _ in range(config.n_output_layer)])
+        self.norm = RMSNorm(config_clone.dim, eps=config.norm_eps)
+        self.linear_head_re = nn.Linear(config_clone.dim, V)
+        self.linear_head_im = nn.Linear(config_clone.dim, V)
+        self.head_causal_mask = None
+
+    def chain_inputs(self, base, t_re, t_im):
+        """base (N, C), t_re / t_im (N, K) target codes -> chain inputs (N, 2K, C) (teacher forcing)."""
+        xs = [base]
+        for i in range(self.num_codebooks):
+            xs.append(self.codebooks_re[i](t_re[:, i]))
+            if i < self.num_codebooks - 1:
+                xs.append(self.codebooks_im[i](t_im[:, i]))
+        x = torch.stack(xs, dim=1)
+        return x + self.pos_emb[None, :, :].to(x.dtype)
+
+    def forward_train(self, base_tokens, targets):
+        K = self.num_codebooks
+        B, L, C = base_tokens.shape
+        t_re = targets[:, 0].permute(0, 2, 1).reshape(B * L, K)
+        t_im = targets[:, 1].permute(0, 2, 1).reshape(B * L, K)
+        h = self.chain_inputs(base_tokens.reshape(B * L, C), t_re, t_im)
+        for layer in self.layers:
+            h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)   # causal over the chain
+        h = self.norm(h)
+        logits_re = self.linear_head_re(h[:, 0::2])                                    # (N, K, V): step 2i -> re_i
+        logits_im = self.linear_head_im(h[:, 1::2])                                    # (N, K, V): step 2i+1 -> im_i
+        logits = torch.stack((logits_re, logits_im), dim=1)                            # (N, 2, K, V)
+        return logits.reshape(B, L, 2, K, -1).permute(0, 2, 3, 1, 4).contiguous()      # (B, 2, K, L, V)
+
+    def forward_test(self, base_tokens, idx=None, input_pos=None, mask=None, return_state=False):
+        """One chain step with the KV cache. s = int(input_pos): s == 0 takes the base state (N, 1, C); s = 2i+1 takes idx = re_i;
+        s = 2i+2 takes idx = im_i (idx: (N,) long). Returns the logits (N, 1, V) of the stream predicted at step s (even Re, odd Im),
+        plus the normalised hidden state (N, 1, C) with return_state."""
+        s = int(input_pos)
+        if s == 0:
+            h = base_tokens
+        elif s % 2 == 1:
+            h = self.codebooks_re[(s - 1) // 2](idx.reshape(-1))[:, None, :]
+        else:
+            h = self.codebooks_im[(s - 2) // 2](idx.reshape(-1))[:, None, :]
+        h = h + self.pos_emb[s][None, None, :].to(h.dtype)
+        for layer in self.layers:
+            h = layer(h, freqs_cis=None, start_pos=input_pos, mask=mask)
+        h = self.norm(h)
+        logits = (self.linear_head_re if s % 2 == 0 else self.linear_head_im)(h)
+        return (logits, h) if return_state else logits
+
+    @torch.no_grad()
+    def rollout(self, base):
+        """Greedy roll-out without KV caches. base (N, C) -> codes (N, 2, K) long, chain state (N, C) = mean over the 2K steps of the
+        normalised hidden state."""
+        K = self.num_codebooks
+        xs, re, im, states = [base], [], [], []
+        for s in range(2 * K):
+            h = torch.stack(xs, dim=1) + self.pos_emb[None, :s + 1, :].to(base.dtype)
+            for layer in self.layers:
+                h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)
+            h = self.norm(h)[:, -1]
+            states.append(h)
+            if s % 2 == 0:
+                c = self.linear_head_re(h).argmax(-1); re.append(c); xs.append(self.codebooks_re[s // 2](c))
+            else:
+                c = self.linear_head_im(h).argmax(-1); im.append(c)
+                if s < 2 * K - 1:
+                    xs.append(self.codebooks_im[s // 2](c))
+        return torch.stack([torch.stack(re, 1), torch.stack(im, 1)], dim=1), torch.stack(states, 1).float().mean(1)
+
+
+def codebook_from_quantizer(quantizer) -> torch.Tensor:
+    """(K, V/K, d) unit-norm rows of the tokenizer's product quantiser (models.quant.VectorQuantizerM), in chunk order."""
+    return torch.stack([cb.codebook.get_norm_weight().detach().float() for cb in quantizer.codebooks])
+
+
+def infer_model_args_from_state_dict(sd, default_mask_width: int = 256) -> dict:
+    """Architecture flags a checkpoint implies (to rebuild a model without its training args): model_version, mask_width,
+    draft_cond, head_interleaved, latent_dim, latent_head_type, latent_mlp_width."""
+    dim = int(sd["norm.weight"].shape[0])
+    out = dict(model_version=(2.1 if "in_proj.0.weight" in sd else (2 if "mask_embed.weight" in sd else 1)),
+               mask_width=(int(sd["mask_embed.weight"].shape[1]) if "mask_embed.weight" in sd else default_mask_width),
+               draft_cond="draft_ln.weight" in sd,
+               head_interleaved="output.merge.weight" not in sd,
+               latent_dim=(int(sd["latent_head.1.weight"].shape[0] // 2) if "latent_head.1.weight" in sd else 0),
+               latent_head_type="linear", latent_mlp_width=0)
+    if "latent_mlp.0.weight" in sd:
+        w = sd["latent_mlp.0.weight"]
+        out["latent_mlp_width"] = int(w.shape[0])
+        out["latent_head_type"] = "fused" if int(w.shape[1]) > dim else "mlp"
+    return out
+
+
+def adapt_mask_width(sd, new_width: int):
+    """Warm-start a v2+ model on another acquisition grid: resample the sampling-mask embedding (Linear(mask_width -> dim), one
+    weight column per k-space column) to the new width by linear interpolation along the column axis, so the learned mask
+    conditioning carries over (its output is RMS-normalised in the model, so the scale change does not matter)."""
+    k = "mask_embed.weight"
+    if k not in sd or int(sd[k].shape[1]) == int(new_width):
+        return sd
+    out = dict(sd)
+    w = sd[k].float()                                                                          # (dim, old_width)
+    out[k] = F.interpolate(w[None], size=int(new_width), mode="linear", align_corners=True)[0].to(sd[k].dtype)
+    return out
+
+
+def remap_v1_to_v2(sd):
+    """Warm-start a v2.1 model from a v1 / v2 checkpoint: drop the v1 input token tables (v2 projects continuous encoder latents) and
+    copy the v1 head tables into both per-stream tables of the interleaved head (Re_7 and the chain positions start fresh)."""
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("re_tok_embeddings.") or k.startswith("im_tok_embeddings."):
+            continue
+        if k.startswith("output.codebooks."):
+            i = k.split(".")[2]
+            out[f"output.codebooks_re.{i}.weight"] = v
+            out[f"output.codebooks_im.{i}.weight"] = v
+            continue
+        out[k] = v
+    return out
+
+
+class AutoRegressiveHeadAsym(nn.Module):
+    """Parallel Re/Im head (K chain steps per position, Re_i and Im_i predicted jointly at step i like the v1 head) with the
+    Re/Im symmetry of the conditioning removed: per-stream embedding tables for the previous codes, concatenated along the
+    channel dimension and projected (the projection is initialised to the v1 sum, so a warm start is unchanged at step 0),
+    plus a learned chain-position embedding."""
+    interleaved = False
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_codebooks = K = config.num_codebooks
+        self.sub_vocab_size = V = config.vocab_size // K
+        self.codebooks_re = nn.ModuleList([nn.Embedding(V, config.dim) for _ in range(K - 1)])
+        self.codebooks_im = nn.ModuleList([nn.Embedding(V, config.dim) for _ in range(K - 1)])
+        self.merge = nn.Linear(2 * config.dim, config.dim, bias=False)
+        with torch.no_grad():
+            self.merge.weight.copy_(torch.cat([torch.eye(config.dim), torch.eye(config.dim)], dim=1))   # == E_re + E_im at init
+        self.pos_emb = nn.Parameter(torch.zeros(K, config.dim))
+        config_clone = copy.deepcopy(config)
+        self.layers = torch.nn.ModuleList([TransformerBlock(config_clone, drop_path=0.) for _ in range(config.n_output_layer)])
+        self.norm = RMSNorm(config_clone.dim, eps=config.norm_eps)
+        self.linear_head_re = nn.Linear(config_clone.dim, V)
+        self.linear_head_im = nn.Linear(config_clone.dim, V)
+        self.head_causal_mask = None
+
+    def _merge(self, i, re_idx, im_idx):
+        return self.merge(torch.cat([self.codebooks_re[i](re_idx), self.codebooks_im[i](im_idx)], dim=-1))
+
+    def forward_train(self, base_tokens, targets):
+        K = self.num_codebooks
+        B, L, C = base_tokens.shape
+        t_re = targets[:, 0].permute(0, 2, 1).reshape(B * L, K)[:, :-1]
+        t_im = targets[:, 1].permute(0, 2, 1).reshape(B * L, K)[:, :-1]
+        prev = torch.stack([self._merge(i, t_re[:, i], t_im[:, i]) for i in range(K - 1)], dim=1)   # (N, K-1, C)
+        h = torch.cat((base_tokens.reshape(B * L, 1, C), prev), dim=1) + self.pos_emb[None, :, :].to(base_tokens.dtype)
+        for layer in self.layers:
+            h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)
+        h = self.norm(h)
+        logits_re = self.linear_head_re(h).reshape(B, L, K, -1).permute(0, 2, 1, 3)
+        logits_im = self.linear_head_im(h).reshape(B, L, K, -1).permute(0, 2, 1, 3)
+        return torch.stack((logits_re, logits_im), dim=1)                                       # (B, 2, K, L, V)
+
+    def forward_test(self, base_tokens, idx=None, input_pos=None, mask=None, return_state=False):
+        s = int(input_pos)
+        h = base_tokens if idx is None else self._merge(s - 1, idx[:, 0], idx[:, 1])          # idx (N, 2, 1) -> (N, 1, C)
+        h = h + self.pos_emb[s][None, None, :].to(h.dtype)
+        for layer in self.layers:
+            h = layer(h, freqs_cis=None, start_pos=input_pos, mask=mask)
+        h = self.norm(h)
+        logits = torch.stack((self.linear_head_re(h), self.linear_head_im(h)), dim=1)           # (N, 2, 1, V)
+        return (logits, h) if return_state else logits
+
+    @torch.no_grad()
+    def rollout(self, base):
+        """Greedy roll-out without KV caches. base (N, C) -> codes (N, 2, K) long, chain state (N, C) = mean over the K steps of the
+        normalised hidden state."""
+        K = self.num_codebooks
+        xs, re, im, states = [base], [], [], []
+        for s in range(K):
+            h = torch.stack(xs, dim=1) + self.pos_emb[None, :s + 1, :].to(base.dtype)
+            for layer in self.layers:
+                h = layer(h, freqs_cis=None, start_pos=None, mask=None, full_attn=False)
+            h = self.norm(h)[:, -1]
+            states.append(h)
+            re.append(self.linear_head_re(h).argmax(-1)); im.append(self.linear_head_im(h).argmax(-1))
+            if s < K - 1:
+                xs.append(self._merge(s, re[-1], im[-1]))
+        return torch.stack([torch.stack(re, 1), torch.stack(im, 1)], dim=1), torch.stack(states, 1).float().mean(1)
 
 
 class AutoRegressiveHeadSingleStream(nn.Module):

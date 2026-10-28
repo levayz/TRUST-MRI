@@ -17,7 +17,8 @@ if str(gen_root) not in sys.path:
 
 from autoregressive.models.gpt_kar import KAR_GPT_models as GPT_models
 from autoregressive.models.gpt_kar import PROBE_GPT_B
-from autoregressive.models.generate import reconstruct_far, active_sampling, active_sampling_patch_logits, data_consistency, image_entropy_to_freq_entropy, active_sampling_entropy_gradient, active_sampling_probe_attention, active_sampling_posterior_sampling
+from models.sense_ops import prepare_sense_batch, tok_upsample, tok_downsample, wrap_dc_fn_resized
+from autoregressive.models.generate import reconstruct_commit, reconstruct_refine, reconstruct_far, active_sampling, active_sampling_patch_logits, data_consistency, image_entropy_to_freq_entropy, active_sampling_entropy_gradient, active_sampling_probe_attention, active_sampling_posterior_sampling, posterior_sampling_reconstruct
 from autoregressive.utils.metrics import compute_reconstruction_metrics
 from models.meditok import MedITok, DotDict
 from dataset.build import build_dataset  # expects args.dataset == 'mri_code'
@@ -468,6 +469,13 @@ def load_gpt(args, device, dtype):
         num_codebooks=args.num_codebooks,
         n_output_layer=args.num_output_layer,
         vq_embed_path=args.vq_embed_path,
+        latent_dim=getattr(args, 'latent_dim', 0),
+        latent_head_type=getattr(args, 'latent_head_type', 'linear'),
+        latent_mlp_width=getattr(args, 'latent_mlp_width', 0),
+        model_version=getattr(args, 'model_version', 1),
+        mask_width=getattr(args, 'mask_width', 256),
+        draft_cond=getattr(args, 'draft_cond', False),
+        head_interleaved=bool(getattr(args, 'head_interleaved', True)),
     )
     if args.probe_model:
         model = PROBE_GPT_B(
@@ -604,6 +612,7 @@ def validate(
     out_dir=None,
     n_imgs_to_save=0,
     save_volumes=True,
+    sense_ctx=None,
 ):
     """
     Run validation/evaluation on a dataset.
@@ -618,6 +627,9 @@ def validate(
         out_dir: Output directory for saving results (if None, uses args.output_dir)
         n_imgs_to_save: how many scans to save for visualization
         save_volumes: Whether to save volume .pt files
+        sense_ctx: SENSE multicoil mode (batches from dataset/sense_data.py): dict(sens_net=, mode='net'|'oracle',
+            center_fractions=). The zero-filled input is recomputed on the GPU with the estimated maps and the
+            reconstruction uses per-coil data consistency through `dc_fn`.
     
     Returns:
         metrics: Dictionary containing per-scan and aggregate metrics
@@ -646,7 +658,9 @@ def validate(
     scan_masked = {}
     
     # which func to use
-    rec_fn = reconstruct_far
+    rec_fn = reconstruct_refine if getattr(args, 'refine_rounds', 0) else reconstruct_far
+    if getattr(args, 'commit_schedule', None):   # progressive commitment (two-view model trained with --commit)
+        rec_fn = reconstruct_commit
     if hasattr(args, 'active_sampling') and args.active_sampling:
         rec_fn = active_sampling # default, based on gen images
         if hasattr(args, 'active_sampling_fn') and args.active_sampling_fn == "patch_logits":
@@ -664,6 +678,21 @@ def validate(
         "top_k": getattr(args, 'top_k', 0)
     }
 
+    # ps_recon: posterior-sampling reconstruction (N stochastic draws on the same mask, averaged)
+    ps_mode = getattr(args, 'ps_n_samples', 1) > 1 and not (hasattr(args, 'active_sampling') and args.active_sampling)
+    ps_kwargs = {}
+    if ps_mode:
+        rec_fn = posterior_sampling_reconstruct
+        ps_kwargs = {
+            "ps_average": getattr(args, 'ps_average', 'magnitude'),
+            "ps_greedy_baseline": bool(getattr(args, 'ps_greedy_baseline', False)),
+        }
+        log_info(f"[ps_recon] posterior-sampling reconstruction: n_samples={args.ps_n_samples}, "
+                 f"sampling={sampling_kwargs}, average={ps_kwargs['ps_average']}, "
+                 f"greedy_baseline={ps_kwargs['ps_greedy_baseline']}")
+    extra_buf = {}   # arm -> scan_key -> {"rec","gt","slice"}   (paired arms: greedy / single_sample)
+    extra_imgs = {}  # arm -> scan_key -> [(slice, rec_np)]
+
     # Build 2D override mask func once (VDS or Poisson), or None for 1D Cartesian
     override_mask_func = _build_2d_mask_func(args)
 
@@ -672,6 +701,21 @@ def validate(
         gt_c_image = batch["gt_c_image"].to(device, non_blocking=True)   # [B,H,W,2],
         masked_c_image = batch["masked_c_image"].to(device, non_blocking=True)   # [B,H,W,2]
         sample_mask = batch["mask"].to(device, non_blocking=True)
+
+        dc_fn = None
+        rec_input = None
+        if sense_ctx is not None:
+            assert "coils" in batch, "sense_ctx given but the batch has no 'coils' (use --dataset sense)"
+            assert not (hasattr(args, 'active_sampling') and args.active_sampling), "active sampling is not supported with SENSE"
+            assert getattr(args, 'initial_mask_type', 'random') == 'random', "2D initial masks are not supported with SENSE"
+            sb = prepare_sense_batch(batch, device, sens_net=sense_ctx.get("sens_net"), mode=sense_ctx.get("mode", "net"),
+                                     center_fractions=sense_ctx.get("center_fractions", 0.04), mask=sample_mask)
+            masked_c_image, dc_fn = sb["masked_c_image"], sb["dc_fn"]
+            del sb
+            tok_size = sense_ctx.get("token_size") or masked_c_image.shape[1]
+            if tok_size != masked_c_image.shape[1]:   # tokenizer / GPT on a larger grid than the acquisition
+                rec_input = tok_upsample(masked_c_image, tok_size, sense_ctx.get("resize_mode", "bicubic"))
+                dc_fn = wrap_dc_fn_resized(dc_fn, masked_c_image.shape[1], tok_size, sense_ctx.get("resize_mode", "bicubic"))
 
         # Override the dataset's 1D Cartesian mask with a 2D VDS/Poisson mask
         if getattr(args, 'initial_mask_type', 'random') in ('vds2d', 'poisson'):
@@ -695,10 +739,12 @@ def validate(
         slice_idx = batch.get("slice", None)
 
         # Autoregressive reconstruction: generate new tokens conditioned on masked tokens
+        if rec_input is None:
+            rec_input = masked_c_image
         rec_c_img, aux = rec_fn(
             gpt,
             meditok,
-            masked_image=masked_c_image,
+            masked_image=rec_input,
             gt_image=gt_c_image,
             sample_mask=sample_mask,
             n_steps=getattr(args, 'n_steps', None),
@@ -707,14 +753,25 @@ def validate(
             viz_gen_steps=getattr(args, 'viz_gen_steps', False),
             budget=getattr(args, 'budget', None),
             rank=getattr(args, 'active_sampling_rank', None),
-            n_samples=getattr(args, 'active_sampling_n_samples', 4),
+            n_samples=(args.ps_n_samples if ps_mode else getattr(args, 'active_sampling_n_samples', 4)),
             sampling_kwargs=sampling_kwargs,
             les_zero_mean=getattr(args, 'les_zero_mean', False),
             les_radial_weight_alpha=getattr(args, 'les_radial_weight_alpha', 0.0),
             center_fractions=getattr(args, 'center_fractions', 0.04),
             active_sampling_mask_type=getattr(args, 'active_sampling_mask_type', 'cartesian'),
             poisson_active_min_dist=getattr(args, 'poisson_active_min_dist', 4.0),
+            dc_fn=dc_fn,
+            refine_rounds=getattr(args, 'refine_rounds', 0),
+            rec_mode=getattr(args, 'rec_mode', 'tokens'),
+            commit_schedule=getattr(args, 'commit_schedule', None),
+            commit_mode=getattr(args, 'commit_mode', 'conf'),
+            **ps_kwargs,
         )  # [B,H,W,2]
+        if rec_c_img.shape[1] != gt_c_image.shape[1]:   # back to the acquisition grid for metrics
+            rec_c_img = tok_downsample(rec_c_img, gt_c_image.shape[1])
+            for _k in ("greedy_rec", "ps_sample0", "ps_mean_no_dc", "decoded_no_dc", "refine_pass1", "alt_rec", "alt_no_dc"):
+                if aux.get(_k) is not None and aux[_k].shape[1] != gt_c_image.shape[1]:
+                    aux[_k] = tok_downsample(aux[_k], gt_c_image.shape[1])
         gen_prog = aux.get("gen_progress", None)
         sample_mask = aux.get("sample_mask", sample_mask)
         masked_c_image = aux.get("masked_image", masked_c_image)
@@ -737,6 +794,25 @@ def validate(
             gt_c_image = inverse_radial_weighting_transform_image(gt_c_image, weights=loader.dataset.radial_weights)
             masked_c_image = inverse_radial_weighting_transform_image(masked_c_image, weights=loader.dataset.radial_weights)
 
+        # ps_recon: paired arms computed on the same mask (greedy argmax, first stochastic draw)
+        extra_arms = {}
+        if ps_mode:
+            for arm_name, aux_key in (("greedy", "greedy_rec"), ("single_sample", "ps_sample0"), ("ps_mean_no_dc", "ps_mean_no_dc")):
+                arm_c = aux.get(aux_key, None)
+                if arm_c is None:
+                    continue
+                if max_val is not None:
+                    arm_c = arm_c * max_val
+                if hasattr(args, 'radial_weighting') and args.radial_weighting:
+                    arm_c = inverse_radial_weighting_transform_image(arm_c, weights=loader.dataset.radial_weights)
+                extra_arms[arm_name] = transforms.complex_abs(arm_c).detach().cpu().float().numpy()
+
+        if aux.get("alt_rec", None) is not None:   # latent-head models: also score the other decoding path
+            arm_c = aux["alt_rec"] * max_val if max_val is not None else aux["alt_rec"]
+            extra_arms["alt_rec"] = transforms.complex_abs(arm_c).detach().cpu().float().numpy()
+        if aux.get("refine_pass1", None) is not None:   # refinement models: also score the first pass
+            arm_c = aux["refine_pass1"] * max_val if max_val is not None else aux["refine_pass1"]
+            extra_arms["refine_pass1"] = transforms.complex_abs(arm_c).detach().cpu().float().numpy()
         rec = transforms.complex_abs(rec_c_img)
         gt = transforms.complex_abs(gt_c_image)
         masked_in = transforms.complex_abs(masked_c_image)
@@ -813,9 +889,18 @@ def validate(
             scan_gts[scan_key].append((sl, gt_np[i]))
             scan_masks[scan_key].append((sl, sample_mask[i].cpu().numpy()))
             scan_masked[scan_key].append((sl, masked_in_np[i]))
+            for arm_name, arm_np in extra_arms.items():
+                arm_buf = extra_buf.setdefault(arm_name, {}).setdefault(scan_key, {"rec": [], "gt": [], "slice": []})
+                arm_buf["rec"].append(arm_np[i])
+                arm_buf["gt"].append(gt_np[i])
+                arm_buf["slice"].append(sl)
+                extra_imgs.setdefault(arm_name, {}).setdefault(scan_key, []).append((sl, arm_np[i]))
 
     # compute per-scan PSNR/SSIM/LPIPS/DISTS
     metrics = compute_reconstruction_metrics(scan_buf, device)
+    extra_metrics = {}
+    for arm_name, arm_buf in extra_buf.items():
+        extra_metrics[arm_name] = compute_reconstruction_metrics(arm_buf, device)
 
     # save middle slice PNG for each of the first n_scans_to_save scans
     n_scans_to_save = getattr(args, 'n_scans_to_save', 4)
@@ -858,8 +943,20 @@ def validate(
                     hf.create_dataset('reconstruction', data=rec_vol, compression='gzip')
                     # hf.create_dataset('ground_truth', data=gt_vol, compression='gzip')
         
-        # save masks if active sampling is enabled
-        if hasattr(args, 'active_sampling') and args.active_sampling:
+        # ps_recon: save the paired greedy reconstruction volumes
+        for arm_name, imgs in extra_imgs.items():
+            if arm_name != "greedy":
+                continue
+            arm_dir = out_dir / f"recon_{arm_name}"
+            arm_dir.mkdir(exist_ok=True)
+            for i, (k, vals) in enumerate(sorted(imgs.items())):
+                if i < n_scans_to_save:
+                    arm_vol = np.stack([x[1] for x in sorted(vals, key=lambda p: p[0])], axis=0)
+                    with h5py.File(arm_dir / f"{k}.h5", 'w') as hf:
+                        hf.create_dataset('reconstruction', data=arm_vol, compression='gzip')
+
+        # save masks if active sampling or ps_recon is enabled
+        if (hasattr(args, 'active_sampling') and args.active_sampling) or ps_mode:
             mask_dir = out_dir / "masks"
             mask_dir.mkdir(exist_ok=True)
             for i, (k, vals) in enumerate(sorted(scan_masks.items())):
@@ -869,13 +966,32 @@ def validate(
                     torch.save(mask_vol, mask_dir / f"{k}_mask.pt")
 
     # save metrics
+    if ps_mode:
+        metrics["ps_config"] = {
+            "n_samples": int(args.ps_n_samples),
+            "top_k": sampling_kwargs["top_k"],
+            "temperature": sampling_kwargs["temperature"],
+            "top_p": sampling_kwargs["top_p"],
+            "average": ps_kwargs["ps_average"],
+            "greedy_baseline": bool(ps_kwargs["ps_greedy_baseline"]),
+            "torch_seed": getattr(args, 'seed', None),
+            "mask_seeded_by_filename": bool(getattr(args, 'use_seed', False)),
+        }
     metrics_path = out_dir / "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
+    for arm_name, m in extra_metrics.items():
+        with open(out_dir / f"metrics_{arm_name}.json", "w") as f:
+            json.dump(m, f, indent=2)
     log_info("metrics:")
     for k, v in metrics.items():
         log_info(f"{k}: {v}")
     log_info(f"PSNR mean: {metrics['psnr_mean']}, SSIM mean: {metrics['ssim_mean']} LPIPS mean: {metrics['lpips_mean']}, DISTS mean: {metrics['dists_mean']}")
+    for arm_name, m in extra_metrics.items():
+        log_info(f"[ps_recon] {arm_name}: PSNR mean: {m['psnr_mean']}, SSIM mean: {m['ssim_mean']} LPIPS mean: {m['lpips_mean']}, DISTS mean: {m['dists_mean']}")
+    if extra_metrics:
+        summary = " ".join(f"{arm}={m['psnr_mean']:.3f}" for arm, m in extra_metrics.items())
+        log_info(f"[ps_recon] PSNR summary: ps_mean={metrics['psnr_mean']:.3f} {summary}")
     log_info(f"{out_dir}")
     
     return metrics
@@ -886,6 +1002,10 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
     torch.set_grad_enabled(False)
+    seed = getattr(args, 'seed', None)
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -1003,6 +1123,12 @@ if __name__ == "__main__":
     # Dataset
     parser.add_argument("--radial-weighting", action='store_true')
     parser.add_argument("--data-split", type=str, default=None, help="path to a .txt file containing filename to test on")
+    parser.add_argument("--use-seed", action='store_true', help="seed the undersampling mask from the filename (one fixed mask per volume, reproducible across runs)")
+    parser.add_argument("--seed", type=int, default=0, help="torch seed for stochastic token sampling")
+    # posterior-sampling reconstruction (ps_recon)
+    parser.add_argument("--ps-n-samples", type=int, default=1, help="ps_recon: number of stochastic reconstructions per slice to average (>1 enables; needs --top-k>0 or --top-p<1)")
+    parser.add_argument("--ps-average", type=str, default="magnitude", choices=["magnitude", "complex"], help="ps_recon: average the samples' magnitudes or the complex images")
+    parser.add_argument("--ps-greedy-baseline", action='store_true', help="ps_recon: also reconstruct greedily (argmax) on the same mask and report metrics_greedy.json")
     parser.add_argument("--end-slice-skip", type=int, default=0, help="number of end slices to skip (0 for knee, 5 for brain)")
 
 

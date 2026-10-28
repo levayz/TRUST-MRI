@@ -15,6 +15,7 @@ from pathlib import Path
 from autoregressive.utils.mask_utils import radial_circle_radii, radial_circle_mask
 from autoregressive.sample.adaptive_sampling import kspace_uncertainty_from_images, kspace_uncertainty_from_patch_logits, image_entropy_to_freq_entropy, _select_points_poisson_constrained
 from models.meditok import MedITok
+from models.sense_ops import decode_latent_pair, latent_target
 
 
 # torch._inductor.config.coordinate_descent_tuning = True
@@ -85,14 +86,8 @@ def sample_far(logits, temperature: float = 1.0, top_k: int = 0, top_p: float = 
 
     do_sample = top_k > 0 or top_p < 1.0
     if not do_sample:
-        # pure temperature sampling: treat every row as a candidate
-        probs = F.softmax(logits, dim=-1)
-        if n_dims == 3:
-            idx = torch.multinomial(probs, num_samples=1)
-        elif n_dims == 4:
-            BL, two, V = probs.shape
-            idx = torch.multinomial(probs.reshape(BL * two, V), num_samples=1).reshape(BL, two)
-        return idx, probs
+        # greedy argmax — matches original deterministic behavior
+        return logits.argmax(dim=-1), None
 
     # top-k / top-p filtering — top_k_top_p_filtering expects 2D (N, V)
     if n_dims == 3:
@@ -467,6 +462,13 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
     default_sampling_kwargs = {"temperature": 1.0, "top_k": 0, "top_p": 1.0}
     if sampling_kwargs is None:
         sampling_kwargs = default_sampling_kwargs
+    # Data consistency to the measurements: single-image hard k-space replace by default, or a caller-supplied
+    # closure (SENSE: expand with the maps -> per-coil replace -> combine; see models.sense_ops.make_sense_dc_fn)
+    dc_fn = kwargs.get("dc_fn", None)
+
+    def dc_meas(img, m):
+        return dc_fn(img, m) if dc_fn is not None else data_consistency(masked_image, img, m)
+
 
     center_fraction = kwargs.get("center_fractions", 0.04)
     mask_levels = get_mask_levels(W, center_fraction=center_fraction, n_steps=kwargs.get("n_steps", None), mode=kwargs.get("far_mask_mode", "cartesian"))
@@ -483,13 +485,34 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
         if kwargs.get("complex_mode", "cartesian") == 'polar':
             i_hat = transforms.cartesian_to_polar(i_hat)
 
-        start_tokens_re = encode(i_hat_prev[..., 0]) # B,K,L
-        start_tokens_im = encode(i_hat_prev[..., 1]) # B,K,L
-        cond_tokens = torch.cat((start_tokens_re.unsqueeze(1), start_tokens_im.unsqueeze(1)), dim=1) # B,2,K,L
+        mv = getattr(model, 'model_version', 1)
+        v2 = mv >= 2.1   # continuous-input models (v2.1)
+        if v2:   # v2.1 reads the continuous encoder latents of the input; its input tokens are never used, so they are not computed
+            cond_tokens = None
+        else:
+            start_tokens_re = encode(i_hat_prev[..., 0]) # B,K,L
+            start_tokens_im = encode(i_hat_prev[..., 1]) # B,K,L
+            cond_tokens = torch.cat((start_tokens_re.unsqueeze(1), start_tokens_im.unsqueeze(1)), dim=1) # B,2,K,L
 
-        t = torch.tensor(idx).to(cond_tokens.device).repeat(B)
-        h = model(cond_tokens=cond_tokens.long(),
-                timestep=t.long()) # (B,L,D)
+        t = torch.tensor(idx + int(kwargs.get("timestep_offset", 0))).to(masked_image.device).repeat(B)   # refinement passes use timestep >= 1
+        extra_in = {}
+        if mv >= 2:   # sampling-mask conditioning
+            extra_in["sample_mask_cols"] = sample_mask[:, 0, :, 0].float()
+        if v2:        # v2.1: continuous encoder latents instead of input tokens
+            extra_in["cond_latent"] = torch.stack([latent_target(tokenizer, i_hat_prev[..., c].float()) for c in range(2)], dim=1)
+        if kwargs.get("draft_image") is not None:   # two-view refinement: the previous reconstruction as a second conditioning view
+            di = kwargs["draft_image"]
+            if v2:
+                extra_in["draft_latent"] = torch.stack([latent_target(tokenizer, di[..., c].float()) for c in range(2)], dim=1)
+            else:
+                extra_in["draft_tokens"] = torch.cat((encode(di[..., 0]).unsqueeze(1), encode(di[..., 1]).unsqueeze(1)), dim=1).long()
+        if kwargs.get("draft_latent") is not None:   # progressive commitment: a precomputed, partial second view (committed positions only)
+            assert v2, "draft_latent needs a v2.1 model"
+            extra_in["draft_latent"] = kwargs["draft_latent"]
+            if kwargs.get("draft_keep") is not None:
+                extra_in["draft_keep"] = kwargs["draft_keep"]
+        h = model(cond_tokens=None if cond_tokens is None else cond_tokens.long(),
+                timestep=t.long(), **extra_in) # (B,L,D)
         if isinstance(h, tuple):
             h, aux = h
         else:
@@ -505,30 +528,54 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
         # AR head
         pred_idx = []
         logits_list = []
+        # the fused latent head also reads the head's chain states (mean of the normalised hidden state over the chain steps)
+        fused = getattr(model, 'latent_head_type', 'linear') == 'fused' and getattr(model, 'latent_head', None) is not None
+        head_states = []
+
+        def head_step(*a, **k):
+            out = model.output.forward_test(*a, **k, **({'return_state': True} if fused else {}))
+            if fused:
+                head_states.append(out[1][:, 0]); return out[0]
+            return out
+        # KV caches must match the dtype the head produces: under autocast the projections are bf16/fp16 even if h is fp32
+        cache_dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else h.dtype
+        interleaved = bool(getattr(model.output, 'interleaved', False))
         model.setup_head_caches(
             B * L,
-            model.num_codebooks,
-            dtype=h.dtype,
+            model.num_codebooks * (2 if interleaved else 1),
+            dtype=cache_dtype,
             device=h.device
         )
         if h_n_dims == 3:
             h = h.view(B*L, 1, D)
         else:
             h = h.permute(0, 2, 1, 3).contiguous().view(B*L, 2, 1, D)
-        for i in range(model.num_codebooks):
-            start_pos = torch.tensor([i], dtype=torch.int)
-            mask = model.output.head_causal_mask[:B*L, None, start_pos]
-            if i == 0:
-                logits = model.output.forward_test(h, input_pos=start_pos, mask=mask) # B*L, 2, 1, V/K
-            else:
-                logits = model.output.forward_test(h, idx=pred_idx[-1], input_pos=start_pos, mask=mask)
-            logits_list.append(logits) # BL, 2, 1, V/K
-            _pred_idx = sample_far(logits, **sampling_kwargs)[0].unsqueeze(-1)
-            pred_idx.append(_pred_idx) # BL, 2, 1
-        pred_idx = torch.stack(pred_idx, dim=2) # B*L, 2,  K, 1
-        pred_idx = pred_idx.view(B, L, 2, -1).permute(0, 2, 3, 1) # B, L, 2, K -> B, 2, K, L
+        if interleaved:   # v2 head: 2K chain steps per position, Re_i at even steps, Im_i (given Re_i) at odd steps
+            codes, lgs, prev = [[], []], [[], []], None
+            for s in range(2 * model.num_codebooks):
+                start_pos = torch.tensor([s], dtype=torch.int)
+                mask = model.output.head_causal_mask[:B*L, None, start_pos]
+                logits = head_step(h if s == 0 else None, idx=prev, input_pos=start_pos, mask=mask)   # BL, 1, V/K
+                prev = sample_far(logits, **sampling_kwargs)[0].reshape(-1)                                           # BL
+                codes[s % 2].append(prev); lgs[s % 2].append(logits[:, 0])
+            pred_idx = torch.stack([torch.stack(codes[0], 1), torch.stack(codes[1], 1)], 1)       # BL, 2, K
+            pred_idx = pred_idx.view(B, L, 2, -1).permute(0, 2, 3, 1)                              # B, 2, K, L
+            logits_list = torch.stack([torch.stack(lgs[0], 1), torch.stack(lgs[1], 1)], 1)         # BL, 2, K, V/K
+        else:
+            for i in range(model.num_codebooks):
+                start_pos = torch.tensor([i], dtype=torch.int)
+                mask = model.output.head_causal_mask[:B*L, None, start_pos]
+                if i == 0:
+                    logits = head_step(h, input_pos=start_pos, mask=mask) # B*L, 2, 1, V/K
+                else:
+                    logits = head_step(h, idx=pred_idx[-1], input_pos=start_pos, mask=mask)
+                logits_list.append(logits) # BL, 2, 1, V/K
+                _pred_idx = sample_far(logits, **sampling_kwargs)[0].unsqueeze(-1)
+                pred_idx.append(_pred_idx) # BL, 2, 1
+            pred_idx = torch.stack(pred_idx, dim=2) # B*L, 2,  K, 1
+            pred_idx = pred_idx.view(B, L, 2, -1).permute(0, 2, 3, 1) # B, L, 2, K -> B, 2, K, L
 
-        logits_list = torch.stack(logits_list, dim=2) # BL, 2, K, V/K
+            logits_list = torch.stack(logits_list, dim=2) # BL, 2, K, V/K
         logits_list = logits_list.view(B, L, 2, model.num_codebooks, -1) # B, L, 2, K, V/K
         logits_list_1d = logits_list.clone()
         H_patch = W_patch = int(L ** 0.5)
@@ -558,11 +605,22 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
             return (img[:,0] + img[:,1] + img[:,2]) / 3
 
         i_hat = rgb_to_grayscale(i_hat) # B, H, W, 2
+        # optional latent-regression head: decode the regressed continuous latent (no quantisation)
+        latent_no_dc = None
+        if getattr(model, 'latent_head', None) is not None and kwargs.get('latent_decode', True) and h_n_dims == 3:
+            if fused:   # conditioned on the codes the token path just committed to (greedy or sampled) and the head's chain state
+                head_state = torch.stack(head_states, dim=1).float().mean(1).view(B, L, D)
+                z_hat = model.predict_latent(h.view(B, L, D), head_state=head_state, head_codes=pred_idx)
+            else:
+                z_hat = model.predict_latent(h.view(B, L, D))
+            latent_no_dc = decode_latent_pair(tokenizer, z_hat)
+            if kwargs.get('rec_mode', 'tokens') == 'latent':
+                i_hat, token_no_dc = latent_no_dc, i_hat
         i_hat_no_dc = i_hat.clone()    # decoded image before any data consistency
 
         # get mask for next level
         if idx == len(mask_levels) - 1: # done, no more masking
-            i_hat = data_consistency(masked_image, i_hat, sample_mask)
+            i_hat = dc_meas(i_hat, sample_mask)
             if kwargs.get("viz_gen_steps", False):
                 gen_prog.append((i_hat, torch.ones_like(sample_mask)))
             break
@@ -570,16 +628,22 @@ def reconstruct_far(model, tokenizer:MedITok, masked_image: torch.Tensor, sample
         mask = get_mask(mask_levels[idx], i_hat, mode=kwargs.get("far_mask_mode", "cartesian"))
         mask_prev = get_mask(mask_levels[idx-1], i_hat, mode=kwargs.get("far_mask_mode", "cartesian"))  
         if kwargs.get("viz_gen_steps", False):
-            i_hat = data_consistency(masked_image, i_hat, sample_mask)
+            i_hat = dc_meas(i_hat, sample_mask)
             gen_prog.append((i_hat, mask.bool() | sample_mask.bool()))
         i_hat = data_consistency(i_hat_prev, i_hat, mask_prev) # DC step for previous step - keep already generated freqs
         i_hat = apply_mask(i_hat, mask) # zero out high freqs
-        i_hat = data_consistency(masked_image, i_hat, sample_mask) # DC to GT samples
+        i_hat = dc_meas(i_hat, sample_mask) # DC to GT samples
         i_hat_prev= i_hat.clone()
 
     model.rm_head_caches()
 
-    return i_hat, {"gen_progress": gen_prog, "logits": logits_list, "logits_1d": logits_list_1d, "model_aux": aux, "decoded_no_dc": i_hat_no_dc} # B,H,W,2, [((B,H,W,2), (B,H,W,2)), ...x mask_levels]
+    out_aux = {"gen_progress": gen_prog, "logits": logits_list, "logits_1d": logits_list_1d, "model_aux": aux, "decoded_no_dc": i_hat_no_dc}
+    out_aux["codes"] = pred_idx                                   # (B, 2, K, L) the codes the token path committed to (greedy or sampled)
+    if latent_no_dc is not None:   # the other decoding path as an extra arm (token path when rec_mode=latent, latent path otherwise)
+        alt = token_no_dc if kwargs.get('rec_mode', 'tokens') == 'latent' else latent_no_dc
+        out_aux["alt_no_dc"] = alt
+        out_aux["alt_rec"] = dc_meas(alt, sample_mask)
+    return i_hat, out_aux # B,H,W,2, [((B,H,W,2), (B,H,W,2)), ...x mask_levels]
 
 
 @torch.no_grad
@@ -716,6 +780,225 @@ def active_sampling_posterior_sampling(model, tokenizer, gt_image: torch.Tensor,
         "sample_masks": sample_masks,
         "sample_progress": sample_progress,
         "score_maps": score_maps,
+    }
+
+
+@torch.no_grad()
+def reconstruct_refine(model, tokenizer, masked_image: torch.Tensor, sample_mask: torch.Tensor, sampling_kwargs=None,
+                       refine_rounds: int = 1, **kwargs):
+    """Iterative refinement for models trained with --refine-rounds (teacher-student scheme):
+    pass 1 = greedy reconstruction of the zero-filled image (timestep 0) + DC; then `refine_rounds` passes where the
+    DC'd previous reconstruction is re-tokenised and fed back with timestep k (k = 1..rounds), each followed by DC.
+    `sampling_kwargs` apply to the refinement passes (pass 1 is always greedy). aux["refine_pass1"] holds the pass-1 image."""
+    kwargs.pop("gt_image", None)
+    kwargs.pop("timestep_offset", None)
+    kwargs.pop("draft_image", None)
+    greedy = {"temperature": 1.0, "top_k": 0, "top_p": 1.0}
+    x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=greedy, timestep_offset=0, **kwargs)
+    pass1 = x
+    two_view = bool(getattr(model, 'draft_cond', False))
+    for k in range(1, int(refine_rounds) + 1):
+        if two_view:   # input stays the zero-filled image; the previous reconstruction enters as the second view
+            x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=sampling_kwargs, timestep_offset=k, draft_image=x, **kwargs)
+        else:
+            x, aux = reconstruct_far(model, tokenizer, x, sample_mask, sampling_kwargs=sampling_kwargs, timestep_offset=k, **kwargs)
+    aux["refine_pass1"] = pass1
+    return x, aux
+
+
+@torch.no_grad()
+def reconstruct_commit(model, tokenizer, masked_image: torch.Tensor, sample_mask: torch.Tensor, sampling_kwargs=None,
+                       commit_schedule=(0.55, 0.8), commit_mode: str = "conf", **kwargs):
+    """Progressive commitment for two-view models trained with --commit. Pass 1 (greedy, timestep 0) gives per-position chunk
+    distributions; for each fraction f of the schedule the f most confident positions (by the expected-embedding concentration,
+    previously kept ones first) are committed: their renormalised expected embeddings form the second view, zero elsewhere, and the
+    model re-predicts with the timestep of f. The last pass uses `sampling_kwargs` (greedy by default); the returned image is that
+    pass's reconstruction (+ DC, latent path when rec_mode='latent'). aux["commit_passes"] holds every pass after pass 1 as dicts
+    main / main_no_dc / alt / alt_no_dc (main = token path, alt = latent path, unless rec_mode='latent'); aux["refine_pass1"] = pass 1."""
+    from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep
+    from autoregressive.models.gpt_kar import codebook_from_quantizer
+    for k in ("gt_image", "timestep_offset", "draft_image", "draft_latent", "draft_keep", "refine_rounds"):
+        kwargs.pop(k, None)
+    greedy = {"temperature": 1.0, "top_k": 0, "top_p": 1.0}
+    codebook = model.latent_codebook if getattr(model, "latent_codebook_ready", False) else codebook_from_quantizer(tokenizer.quantizer).to(masked_image.device)
+    x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=greedy, timestep_offset=0, **kwargs)
+    pass1 = x
+    view, conf = expected_embedding_view(aux["logits_1d"], codebook)
+    B, L = conf.shape
+    keep = torch.zeros(B, L, device=conf.device)
+    committed = torch.zeros_like(view)
+    passes = []
+    schedule = list(commit_schedule)
+    for k, f in enumerate(schedule, 1):
+        new_keep = commit_keep_mask(conf, f, commit_mode, already=keep)
+        newly = (new_keep > keep)[:, None, :, None]                                       # (B, 1, L, 1)
+        committed = torch.where(newly, view, committed)
+        keep = new_keep
+        t = int(commit_timestep(f)[0])
+        kw = sampling_kwargs if (k == len(schedule) and sampling_kwargs is not None) else greedy
+        x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=kw, timestep_offset=t,
+                                 draft_latent=committed, draft_keep=keep, **kwargs)
+        passes.append({"main": x, "main_no_dc": aux.get("decoded_no_dc"), "alt": aux.get("alt_rec"), "alt_no_dc": aux.get("alt_no_dc"),
+                       "keep": keep.clone(), "timestep": t})
+        view_k, conf_k = expected_embedding_view(aux["logits_1d"], codebook)
+        view = torch.where(keep.bool()[:, None, :, None], committed, view_k)
+        conf = torch.where(keep.bool(), torch.full_like(conf_k, float("inf")), conf_k)
+    aux["commit_passes"] = passes
+    aux["refine_pass1"] = pass1
+    return x, aux
+
+
+@torch.no_grad()
+def posterior_sampling_reconstruct(model, tokenizer, masked_image: torch.Tensor, sample_mask: torch.Tensor,
+                                   sampling_kwargs=None, n_samples: int = 8, ps_average: str = "magnitude",
+                                   ps_greedy_baseline: bool = False, **kwargs):
+    """Posterior-sampling reconstruction ("ps_recon").
+
+    Plain single-step reconstruction, repeated: draw ``n_samples`` stochastic reconstructions of
+    the *same* masked measurements (``sampling_kwargs`` must enable sampling, e.g. top_k > 0),
+    each with its own data-consistency step inside ``reconstruct_far``, and average them:
+      * ps_average="magnitude": mean of |x_s|   (the quantity PSNR/SSIM are computed on)
+      * ps_average="complex":   mean of x_s     (|.| is taken downstream)
+
+    Returns ``(rec, aux)`` where ``rec`` is (B,H,W,2) such that ``transforms.complex_abs(rec)``
+    is the averaged magnitude image. ``aux["ps_sample0"]`` is the first stochastic draw and, if
+    ``ps_greedy_baseline``, ``aux["greedy_rec"]`` is the argmax reconstruction on the same mask.
+    """
+    B, H, W, _ = masked_image.shape
+    kwargs.pop("gt_image", None)   # only the active-sampling variants need the ground truth
+
+    if sampling_kwargs is None or (sampling_kwargs.get("top_k", 0) <= 0 and sampling_kwargs.get("top_p", 1.0) >= 1.0):
+        print("[ps_recon] WARNING: sampling_kwargs are greedy (top_k=0, top_p=1); all samples will be identical")
+
+    masked_rep = masked_image.repeat(n_samples, 1, 1, 1)   # (S*B, H, W, 2): identical measurements
+    mask_rep   = sample_mask.repeat(n_samples, 1, 1, 1)    # (S*B, H, W, 2): identical mask
+    refine_rounds = int(kwargs.pop("refine_rounds", 0) or 0)
+    if refine_rounds > 0:   # refinement-trained model: greedy pass 1, sampled refinement passes
+        rec_batch, rec_aux = reconstruct_refine(model, tokenizer, masked_rep, mask_rep, sampling_kwargs=sampling_kwargs,
+                                                refine_rounds=refine_rounds, **kwargs)
+    else:
+        rec_batch, rec_aux = reconstruct_far(model, tokenizer, masked_rep, mask_rep,
+                                             sampling_kwargs=sampling_kwargs, **kwargs)
+    rec = rec_batch.reshape(n_samples, B, H, W, 2)         # every sample is already data-consistent
+
+    if ps_average == "complex":
+        rec_mean = rec.mean(dim=0)                                        # (B, H, W, 2)
+    elif ps_average == "magnitude":
+        mag_mean = transforms.complex_abs(rec).mean(dim=0)                # (B, H, W)
+        rec_mean = torch.stack([mag_mean, torch.zeros_like(mag_mean)], dim=-1)
+    else:
+        raise ValueError(f"unknown ps_average: {ps_average}")
+
+    aux = {"ps_sample0": rec[0]}
+    # the same average over the decoded samples BEFORE data consistency ("PS (re+im)" without DC)
+    no_dc = rec_aux.get("decoded_no_dc", None)
+    if no_dc is not None:
+        no_dc = no_dc.reshape(n_samples, B, H, W, 2)
+        if ps_average == "complex":
+            aux["ps_mean_no_dc"] = no_dc.mean(dim=0)
+        else:
+            m_no_dc = transforms.complex_abs(no_dc).mean(dim=0)
+            aux["ps_mean_no_dc"] = torch.stack([m_no_dc, torch.zeros_like(m_no_dc)], dim=-1)
+    if ps_greedy_baseline:
+        greedy_kwargs = {"temperature": 1.0, "top_k": 0, "top_p": 1.0}
+        if refine_rounds > 0:
+            aux["greedy_rec"], _ = reconstruct_refine(model, tokenizer, masked_image, sample_mask, sampling_kwargs=greedy_kwargs,
+                                                      refine_rounds=refine_rounds, **kwargs)
+        else:
+            aux["greedy_rec"], _ = reconstruct_far(model, tokenizer, masked_image, sample_mask,
+                                                   sampling_kwargs=greedy_kwargs, **kwargs)
+    return rec_mean, aux
+
+
+@torch.no_grad()
+def active_sampling_tds(
+    model,
+    tokenizer,
+    gt_image: torch.Tensor,
+    masked_image: torch.Tensor,
+    sample_mask: torch.Tensor,
+    budget: int,
+    rank: int = 1,
+    **kwargs,
+):
+    """Token Distribution Shift (TDS) active acquisition loop.
+
+    At each step:
+      1. reconstruct_far → logits + decoded x_hat  (decode happens here, once)
+      2. tds_score_step  → simulate each unacquired line, pick best
+      3. Update mask and apply data-consistency with ground-truth
+
+    All TDS hyperparameters are passed through **kwargs with ``tds_`` prefix:
+        tds_distance, tds_foreground_mode, tds_foreground_percentile,
+        tds_foreground_threshold, tds_top_m, tds_alpha, tds_beta,
+        tds_candidate_mode, tds_candidate_k, tds_entropy_normalization,
+        tds_line_aggregation, tds_candidate_batch_size
+    """
+    import time as _time
+    from autoregressive.sample.tds import tds_score_step
+
+    B, H, W, _ = masked_image.shape
+    device = masked_image.device
+    n_steps = budget // rank
+
+    sampling_kwargs = kwargs.get("sampling_kwargs", {"temperature": 1.0, "top_k": 0, "top_p": 1.0})
+
+    tds_kwargs = {
+        k: kwargs[k]
+        for k in kwargs
+        if k.startswith("tds_")
+    }
+
+    sample_masks    = [sample_mask.clone()]
+    sample_progress = [masked_image.clone()]
+    diagnostics_all = []
+
+    for _step in tqdm(range(n_steps), "TDS"):
+        t_step = _time.perf_counter()
+
+        # Reconstruction + decode-once
+        t_decode = _time.perf_counter()
+        rec_img, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, **kwargs)
+        t_decode_end = _time.perf_counter()
+
+        logits_old = aux["logits"]         # (B, H_p, W_p, 2, K, V_K)
+        x_hat      = aux["decoded_no_dc"]  # (B, H, W, 2) — before data-consistency
+
+        y_omega = transforms.fft2(masked_image)  # (B, H, W, 2)
+
+        result = tds_score_step(
+            model, tokenizer,
+            y_omega, sample_mask, x_hat, logits_old,
+            device, sampling_kwargs,
+            **tds_kwargs,
+        )
+
+        best_col  = result["selected_col"]
+        diag      = result["diagnostics"]
+        diag["runtime_decode_s"] = t_decode_end - t_decode
+        diag["runtime_total_s"]  = _time.perf_counter() - t_step
+        diagnostics_all.append(diag)
+
+        # Update Cartesian mask (full column)
+        new_mask = sample_mask.clone()
+        new_mask[:, :, best_col, :] = 1.0
+        sample_mask = new_mask
+
+        masked_image = data_consistency(
+            gt_image, torch.zeros_like(masked_image), sample_mask
+        )
+        sample_masks.append(sample_mask.clone())
+        sample_progress.append(masked_image.clone())
+
+    # Final reconstruction
+    rec_image, _ = reconstruct_far(model, tokenizer, masked_image, sample_mask, **kwargs)
+
+    return rec_image, {
+        "sample_mask": sample_mask,
+        "masked_image": masked_image,
+        "sample_masks": sample_masks,
+        "sample_progress": sample_progress,
+        "diagnostics": diagnostics_all,
     }
 
 
