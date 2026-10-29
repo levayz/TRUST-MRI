@@ -36,7 +36,7 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
 from autoregressive.models.gpt_kar import KAR_GPT_models, PROBE_GPT_B, remap_v1_to_v2, adapt_mask_width, codebook_from_quantizer
-from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep
+from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep, codes_to_view
 from autoregressive.sample.reconstruct_far import validate
 from autoregressive.models.generate import reconstruct_far as _reconstruct_far
 from autoregressive.utils.mask_utils import (
@@ -301,7 +301,8 @@ def create_validation_args(train_args, experiment_dir, epoch, train_steps):
     val_args.draft_cond = getattr(train_args, 'draft_cond', False)
     val_args.gt_cache_dir = None   # validation scores images; no ground-truth tokens needed
     val_args.commit_schedule = getattr(train_args, 'commit_schedule', None) if getattr(train_args, 'commit', 'none') != 'none' else None
-    val_args.commit_mode = getattr(train_args, 'commit', 'conf')
+    val_args.commit_mode = 'conf'
+    val_args.commit_view = 'codes' if getattr(train_args, 'commit', 'none') == 'gt' else 'expected'
     val_args.head_interleaved = getattr(train_args, 'head_interleaved', 1)
     
     # Sampling settings (fixed for validation)
@@ -776,14 +777,26 @@ def main(args):
                             else {"temperature": 1.0, "top_k": 0, "top_p": 1.0})
                 nb_ref = args.refine_batch if args.refine_batch > 0 else masked_in.shape[0]
                 draft_keep = None
+                loss_mask_ref = None
                 t_ref = torch.ones_like(t[:nb_ref]).long()
-                with torch.no_grad(), torch.cuda.amp.autocast(dtype=ptdtype):
-                    x_draft, aux_d = _reconstruct_far(teacher, meditok, masked_in[:nb_ref], sample_mask[:nb_ref], sampling_kwargs=draft_kw, n_steps=1,
-                                                      far_mask_mode=args.far_mask_mode, complex_mode=args.complex_mode,
-                                                      center_fractions=args.center_fractions, dc_fn=sense_dc_fn_ref, timestep_offset=0,
-                                                      latent_decode=(args.commit == 'none'))
+                x_draft = aux_d = None
+                if args.commit != 'gt':   # the teacher drafts pass 1 (not needed when the revealed view is the ground truth)
+                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=ptdtype):
+                        x_draft, aux_d = _reconstruct_far(teacher, meditok, masked_in[:nb_ref], sample_mask[:nb_ref], sampling_kwargs=draft_kw, n_steps=1,
+                                                          far_mask_mode=args.far_mask_mode, complex_mode=args.complex_mode,
+                                                          center_fractions=args.center_fractions, dc_fn=sense_dc_fn_ref, timestep_offset=0,
+                                                          latent_decode=(args.commit == 'none'))
                 with torch.no_grad():   # draft features in fp32 like the input (bf16 flips ~30% of the near-tie codes)
-                    if args.commit != 'none':
+                    if args.commit == 'gt':
+                        # MaskGIT-style: the second view carries the ground truth's codebook rows at a random fraction of the positions
+                        # (zero elsewhere), the timestep encodes the fraction, and the token / latent losses count only the other positions
+                        frac = torch.empty(nb_ref, device=device).uniform_(args.commit_keep[0], args.commit_keep[1])
+                        draft_keep = commit_keep_mask(torch.zeros(nb_ref, gt_tokens.shape[-1], device=device), frac, 'random')
+                        draft_latent = codes_to_view(gt_tokens[:nb_ref].long(), commit_codebook)
+                        loss_mask_ref = 1.0 - draft_keep
+                        t_ref = commit_timestep(frac).to(device)
+                        draft_tokens = None
+                    elif args.commit != 'none':
                         # progressive commitment: the second view is the expected codebook embedding of the teacher's pass-1 chunk
                         # distributions at the committed positions (a random fraction per sample, chosen by the latent spread or at
                         # random) and zero elsewhere; the timestep encodes the committed fraction
@@ -804,7 +817,7 @@ def main(args):
                 with torch.cuda.amp.autocast(dtype=ptdtype):
                     if args.model_version >= 2.1:
                         if args.draft_cond:   # two-view: zero-filled latents + draft latents as the second view
-                            _, *rest_ref = model(targets=gt_tokens[:nb_ref].long(), cond_latent=cond_latent[:nb_ref], draft_latent=draft_latent, draft_keep=draft_keep, timestep=t_ref, sample_mask_cols=mask_cols[:nb_ref], target_image=gt_c_image[:nb_ref])
+                            _, *rest_ref = model(targets=gt_tokens[:nb_ref].long(), cond_latent=cond_latent[:nb_ref], draft_latent=draft_latent, draft_keep=draft_keep, loss_mask=loss_mask_ref, return_latent=(args.lambda_latent > 0), timestep=t_ref, sample_mask_cols=mask_cols[:nb_ref], target_image=gt_c_image[:nb_ref])
                         else:                 # single view: the draft replaces the zero-filled input
                             _, *rest_ref = model(targets=gt_tokens[:nb_ref].long(), cond_latent=draft_latent, timestep=t_ref, sample_mask_cols=mask_cols[:nb_ref], target_image=gt_c_image[:nb_ref])
                     elif args.draft_cond:   # two-view: zero-filled tokens + draft tokens as the second view
@@ -812,6 +825,14 @@ def main(args):
                     else:                 # single view: the draft replaces the zero-filled input
                         _, *rest_ref = model(targets=gt_tokens[:nb_ref].long(), cond_tokens=draft_tokens.long(), timestep=t_ref, sample_mask_cols=mask_cols[:nb_ref], target_image=gt_c_image[:nb_ref])
                 loss_ref = rest_ref[0]
+                if args.lambda_latent > 0 and len(rest_ref) > 1 and rest_ref[1] is not None:   # latent regression on the second pass too
+                    d2 = ((rest_ref[1].float() - gt_latent[:nb_ref]) ** 2).sum(-1) * (args.num_codebooks / gt_latent.shape[-1])   # (nb, 2, L)
+                    if loss_mask_ref is not None:
+                        wl = loss_mask_ref[:, None, :].expand_as(d2)
+                        loss_lat_ref = (d2 * wl).sum() / wl.sum().clamp_min(1.0)
+                    else:
+                        loss_lat_ref = d2.mean()
+                    loss_ref = loss_ref + args.lambda_latent * loss_lat_ref
                 loss_ref_val = loss_ref.item()
                 scaler.scale(args.refine_weight * loss_ref).backward()
                 loss_total_val += args.refine_weight * loss_ref_val
@@ -1155,7 +1176,7 @@ if __name__ == "__main__":
     parser.add_argument("--refine-batch", type=int, default=0, help="samples per step used for the refinement pass (0 = full batch); lower it to save memory")
     parser.add_argument("--latent-dim", type=int, default=0, help=">0: add a latent-regression head (tokenizer latent width, 64 for MedITok)")
     parser.add_argument("--draft-cond", action="store_true", help="two-view refinement: the refine pass sees the zero-filled tokens plus the DC'd draft's tokens as a second view (needs --refine-rounds)")
-    parser.add_argument("--commit", type=str, default="none", choices=["none", "conf", "random"], help="progressive commitment fine-tune (with --refine-rounds 1 --draft-cond, model v2.1): the refine pass sees the expected-embedding view of the teacher's pass 1 at a committed fraction of positions, chosen by confidence (latent spread) or at random")
+    parser.add_argument("--commit", type=str, default="none", choices=["none", "conf", "random", "gt"], help="progressive commitment fine-tune (with --refine-rounds 1 --draft-cond, model v2.1): the refine pass sees the expected-embedding view of the teacher's pass 1 at a committed fraction of positions, chosen by confidence (latent spread) or at random")
     parser.add_argument("--commit-keep", type=float, nargs=2, default=[0.3, 0.9], help="range of the committed fraction drawn per sample in training")
     parser.add_argument("--commit-schedule", type=float, nargs="*", default=[0.55, 0.8], help="validation: committed fractions of the passes after pass 1")
     parser.add_argument("--head-interleaved", type=int, default=1, choices=[0, 1], help="v2.1 head: 1 = interleaved Re/Im chain, 0 = parallel asymmetric head")

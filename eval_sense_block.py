@@ -82,6 +82,7 @@ def parse_args():
     p.add_argument("--refine-rounds", type=int, default=0, help="models trained with --refine-rounds: N refinement passes (timestep k) after the greedy pass; arms refine{k}_dc; exp/PS arms are computed on the last pass")
     p.add_argument("--commit-schedule", type=float, nargs="*", default=[], help="two-view models trained with --commit: progressive-commitment passes at these committed fractions after the greedy pass; arms commit{k}_greedy_dc / commit{k}_latent_dc")
     p.add_argument("--commit-mode", default="conf", choices=["conf", "random"])
+    p.add_argument("--commit-view", default="expected", choices=["expected", "codes"], help="codes = MaskGIT-style hard commitment of sampled codes (models trained with --commit gt): adds commit_single_dc, commit_ps_mean_dc, commit_latent_dc, commit_latent_mean_dc and hybrid_c* arms")
     p.add_argument("--top-k", type=int, default=4096)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -134,6 +135,7 @@ def main():
 
     arms = list(BASE_ARMS) + (["latent_no_dc", "latent_dc"] if (gpt is not None and getattr(gpt, 'latent_head', None) is not None) else []) + [f"refine{k}_no_dc" for k in range(1, args.refine_rounds + 1)] + [f"refine{k}_dc" for k in range(1, args.refine_rounds + 1)] \
         + [a for t in args.exp_temperatures for a in (f"exp{t:g}_no_dc", f"exp{t:g}_dc")] + [f"iter{i}_dc" for i in range(2, args.iters + 1)] + [f"commit{k}_{src}_dc" for k in range(1, len(args.commit_schedule) + 1) for src in ("greedy", "latent")] \
+        + (["commit_single_dc", "commit_ps_mean_dc", "commit_latent_dc", "commit_latent_mean_dc"] + [f"hybrid_{src}_r{r:g}_dc" for r in args.hybrid_radii for src in ("c", "cm")] if (args.commit_schedule and args.commit_view == "codes") else []) \
         + [f"hybrid_{src}_r{r:g}_{k}" for r in args.hybrid_radii for src in ("g", "s", "m") for k in ("dc", "dcs")] + (["latent_dc256", "greedy_dc256"] if args.hybrid_radii else [])
     if args.hybrid_radii:
         assert gpt is not None and getattr(gpt, 'latent_head', None) is not None, "--hybrid-radii needs a model with a latent head"
@@ -260,7 +262,7 @@ def main():
                 if args.commit_schedule:                                # progressive commitment passes after the greedy pass
                     assert getattr(gpt, "draft_cond", False), "--commit-schedule needs a two-view model trained with --commit"
                     _, auxc = reconstruct_commit(gpt, meditok, masked_image, sample_mask, sampling_kwargs=greedy_kw, dc_fn=dc_tok,
-                                                 commit_schedule=args.commit_schedule, commit_mode=args.commit_mode, **far_kwargs)
+                                                 commit_schedule=args.commit_schedule, commit_mode=args.commit_mode, commit_view=args.commit_view, **far_kwargs)
                     for k, ps_ in enumerate(auxc["commit_passes"], 1):
                         rec_c(f"commit{k}_greedy_dc", dc_arm(ps_["main_no_dc"], ps_["main"]))
                         if ps_.get("alt_no_dc") is not None:
@@ -282,6 +284,26 @@ def main():
                 smp = r2c(down(aux["decoded_no_dc"])).reshape(n, B, cs, cs)
                 smp_dc = dc(smp.reshape(n * B, cs, cs)).reshape(n, B, cs, cs) if args.dc_path == "acq" else r2c(down(rec)).reshape(n, B, cs, cs)
                 rec_m("ps_mean_no_dc", smp.abs().mean(0)); rec_m("ps_mean_dc", smp_dc.abs().mean(0)); rec_c("ps_single_dc", smp_dc[0])
+                if args.commit_schedule and args.commit_view == "codes":
+                    # MaskGIT-style hard commitment on n sampled draws: coherent samples, their magnitude mean, the last pass's latent head
+                    n = args.ps_n_samples
+                    _, auxs = reconstruct_commit(gpt, meditok, masked_image.repeat(n, 1, 1, 1), sample_mask.repeat(n, 1, 1, 1), sampling_kwargs=ps_kw, dc_fn=dc_tok,
+                                                 commit_schedule=args.commit_schedule, commit_mode=args.commit_mode, commit_view="codes", **far_kwargs)
+                    last = auxs["commit_passes"][-1]
+                    csmp = r2c(down(last["main_no_dc"])).reshape(n, B, cs, cs)                      # committed codes decoded, no DC
+                    clat = r2c(down(last["alt_no_dc"])).reshape(n, B, cs, cs) if last.get("alt_no_dc") is not None else None
+                    csmp_dc = dc(csmp.reshape(n * B, cs, cs)).reshape(n, B, cs, cs) if args.dc_path == "acq" else r2c(down(last["main"])).reshape(n, B, cs, cs)
+                    rec_c("commit_single_dc", csmp_dc[0]); rec_m("commit_ps_mean_dc", csmp_dc.abs().mean(0))
+                    if clat is not None:
+                        clat_dc = dc(clat.reshape(n * B, cs, cs)).reshape(n, B, cs, cs) if args.dc_path == "acq" else r2c(down(last["alt"])).reshape(n, B, cs, cs)
+                        rec_c("commit_latent_dc", clat_dc[0]); rec_m("commit_latent_mean_dc", clat_dc.abs().mean(0))
+                    if args.hybrid_radii:
+                        k_lat_c = fft2c(hy_lat)
+                        for src, img in (("c", csmp[0]), ("cm", csmp.mean(0))):
+                            k_src = fft2c(img)
+                            for r, W in hybrid_windows.items():
+                                rec_c(f"hybrid_{src}_r{r:g}_dc", dc(ifft2c(W * k_lat_c + (1 - W) * k_src)))
+                    del auxs
                 if args.hybrid_radii:
                     # hybrid decoding: latent one pass below the radius, a token decoding above it, merged in k-space, then per-coil DC
                     k_lat = fft2c(hy_lat)
@@ -297,7 +319,7 @@ def main():
                "sens_maps": args.sens_maps, "sens_ckpt": args.sens_ckpt, "eval_support": args.eval_support,
                "crop_size": cs, "token_size": tok, "resize_mode": args.resize_mode, "encoder_config": args.encoder_config,
                "ps": {"n_samples": args.ps_n_samples, "top_k": args.top_k, "temperature": args.temperature, "top_p": args.top_p, "seed": args.seed},
-               "exp_temperatures": args.exp_temperatures, "iters": args.iters, "refine_rounds": args.refine_rounds, "commit_schedule": args.commit_schedule, "commit_mode": args.commit_mode,
+               "exp_temperatures": args.exp_temperatures, "iters": args.iters, "refine_rounds": args.refine_rounds, "commit_schedule": args.commit_schedule, "commit_mode": args.commit_mode, "commit_view": args.commit_view,
                "mask_check": mask_check,
                "gt_ref": args.gt_ref,
                "n_volumes": len((bufs or bufs_rss)["zero_filled"]), "n_slices": sum(len(v["slice"]) for v in (bufs or bufs_rss)["zero_filled"].values())}

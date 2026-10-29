@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from autoregressive.models.gpt_kar import ModelArgs, Transformer
-from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep
+from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep, codes_to_view
 
 K, V, DIM, GRID, DZ = 8, 16 * 8, 64, 2, 16
 L = GRID * GRID
@@ -84,3 +84,30 @@ def test_keep_mask_fraction_monotone_and_random():
 
 def test_timestep_from_fraction():
     assert commit_timestep(torch.tensor([0.0, 0.3, 0.55, 0.8, 0.9, 1.0])).tolist() == [1, 2, 3, 4, 5, 5]
+
+
+def test_loss_mask_all_ones_equals_plain_loss_and_single_position_matches_manual():
+    m = make(); cond, draft, targets, cols = inputs()
+    with torch.no_grad():
+        _, loss = m(targets=targets, cond_latent=cond, timestep=torch.ones(2, dtype=torch.long), sample_mask_cols=cols)
+        _, loss_ones = m(targets=targets, cond_latent=cond, timestep=torch.ones(2, dtype=torch.long), sample_mask_cols=cols, loss_mask=torch.ones(2, L))
+        assert torch.allclose(loss, loss_ones, atol=1e-6)
+        mask = torch.zeros(2, L); mask[:, 1] = 1
+        logits, loss_one = m(targets=targets, cond_latent=cond, timestep=torch.ones(2, dtype=torch.long), sample_mask_cols=cols, loss_mask=mask)
+        V = logits.shape[-1]
+        manual = sum(F.cross_entropy(logits[:, s, :, 1, :].reshape(-1, V), targets[:, s, :, 1].reshape(-1)) for s in range(2)) / 2
+        assert torch.allclose(loss_one, manual, atol=1e-5), (float(loss_one), float(manual))
+
+
+def test_codes_to_view_matches_the_fused_head_lookup():
+    g = torch.Generator().manual_seed(0)
+    cb = F.normalize(torch.randn(K, V // K, DZ // K, generator=g), dim=-1)
+    codes = torch.randint(0, V // K, (2, 2, K, L), generator=g)
+    m = make(); m.set_latent_codebook_tensor(cb) if hasattr(m, "set_latent_codebook_tensor") else None
+    view = codes_to_view(codes, cb)
+    assert view.shape == (2, 2, L, DZ)
+    rows = torch.cat([cb[k][codes[:, :, k]] for k in range(K)], dim=-1)
+    assert torch.equal(view, rows)
+    one_hot = torch.full((2, L, 2, K, V // K), -1e4); one_hot.scatter_(-1, codes.permute(0, 3, 1, 2)[..., None], 1e4)
+    ev, _ = expected_embedding_view(one_hot, cb)
+    assert torch.allclose(ev, view, atol=1e-5), "hard rows must equal the expected embedding of a one-hot belief"

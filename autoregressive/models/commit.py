@@ -21,6 +21,12 @@ def expected_embedding_view(logits: torch.Tensor, codebook: torch.Tensor, temper
     return view, conf
 
 
+def codes_to_view(codes: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """codes (B, 2, K, L) -> (B, 2, L, K*d): the codebook rows of the codes in the draft_latent layout (the quantised latent;
+    the ground truth's rows in MaskGIT-style training, the sampled codes' rows at inference)."""
+    return torch.cat([codebook[k][codes[:, :, k]] for k in range(codes.shape[2])], dim=-1)
+
+
 def commit_keep_mask(conf: torch.Tensor, frac, mode: str = "conf", already: torch.Tensor = None) -> torch.Tensor:
     """(B, L) float mask with round(frac * L) ones per sample: the most confident positions (mode 'conf') or random ones ('random').
     Positions already kept (`already`, (B, L)) stay kept and count toward the fraction."""

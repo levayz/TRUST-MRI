@@ -782,6 +782,7 @@ class Transformer(nn.Module):
             cond_latent: torch.Tensor = None,  # [B, 2, L, Dz] continuous encoder latents of the input (model v2.1)
             draft_latent: torch.Tensor = None,  # [B, 2, L, Dz] latents of the previous reconstruction (model v2.1 two-view refinement)
             draft_keep: torch.Tensor = None,  # [B, L] progressive commitment: 1 = the draft view is committed at this position, 0 = no draft there
+            loss_mask: torch.Tensor = None,  # [B, L] per-position weights of the token loss (e.g. the positions not revealed by the draft view)
             **kwargs,
     ):
         assert self.cond_token_num > 0, "cond_token_num must be greater than 0"
@@ -870,6 +871,13 @@ class Transformer(nn.Module):
             # valid_all = valid[:, None].repeat(1, targets.shape[1]).view(-1)
             # loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
             pass
+        elif targets is not None and loss_mask is not None:
+            # weighted token loss: rows of logits[:, s].reshape(-1, V) are ordered (B, K, L), like targets[:, s]
+            V = logits.size(-1)
+            w = loss_mask.float()[:, None, :].expand(-1, targets.shape[2], -1).reshape(-1)
+            l_re = F.cross_entropy(logits[:, 0, :, :, :].reshape(-1, V), targets[:, 0].reshape(-1), reduction='none')
+            l_im = F.cross_entropy(logits[:, 1, :, :, :].reshape(-1, V), targets[:, 1].reshape(-1), reduction='none')
+            loss = ((l_re + l_im) * w).sum() / (2 * w.sum().clamp_min(1.0))
         elif targets is not None:
             # targets shape: [B, K, L]
             # logits shape (after view): [B*K*L, V/K]

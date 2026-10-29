@@ -808,44 +808,72 @@ def reconstruct_refine(model, tokenizer, masked_image: torch.Tensor, sample_mask
 
 @torch.no_grad()
 def reconstruct_commit(model, tokenizer, masked_image: torch.Tensor, sample_mask: torch.Tensor, sampling_kwargs=None,
-                       commit_schedule=(0.55, 0.8), commit_mode: str = "conf", **kwargs):
+                       commit_schedule=(0.55, 0.8), commit_mode: str = "conf", commit_view: str = "expected", **kwargs):
     """Progressive commitment for two-view models trained with --commit. Pass 1 (greedy, timestep 0) gives per-position chunk
     distributions; for each fraction f of the schedule the f most confident positions (by the expected-embedding concentration,
     previously kept ones first) are committed: their renormalised expected embeddings form the second view, zero elsewhere, and the
     model re-predicts with the timestep of f. The last pass uses `sampling_kwargs` (greedy by default); the returned image is that
     pass's reconstruction (+ DC, latent path when rec_mode='latent'). aux["commit_passes"] holds every pass after pass 1 as dicts
     main / main_no_dc / alt / alt_no_dc (main = token path, alt = latent path, unless rec_mode='latent'); aux["refine_pass1"] = pass 1."""
-    from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep
+    from autoregressive.models.commit import expected_embedding_view, commit_keep_mask, commit_timestep, codes_to_view
     from autoregressive.models.gpt_kar import codebook_from_quantizer
     for k in ("gt_image", "timestep_offset", "draft_image", "draft_latent", "draft_keep", "refine_rounds"):
         kwargs.pop(k, None)
     greedy = {"temperature": 1.0, "top_k": 0, "top_p": 1.0}
+    hard = commit_view == "codes"   # MaskGIT style: commit the codes themselves (sampled with sampling_kwargs in every pass)
     codebook = model.latent_codebook if getattr(model, "latent_codebook_ready", False) else codebook_from_quantizer(tokenizer.quantizer).to(masked_image.device)
-    x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=greedy, timestep_offset=0, **kwargs)
+    kw1 = sampling_kwargs if (hard and sampling_kwargs is not None) else greedy
+    x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=kw1, timestep_offset=0, **kwargs)
     pass1 = x
     view, conf = expected_embedding_view(aux["logits_1d"], codebook)
+    codes = aux["codes"].long()                                                            # (B, 2, K, L) the codes of this pass
+    if hard:
+        view = codes_to_view(codes, codebook)
     B, L = conf.shape
     keep = torch.zeros(B, L, device=conf.device)
     committed = torch.zeros_like(view)
+    c_committed = codes.clone()
     passes = []
     schedule = list(commit_schedule)
+    dc_fn = kwargs.get("dc_fn", None)
     for k, f in enumerate(schedule, 1):
         new_keep = commit_keep_mask(conf, f, commit_mode, already=keep)
-        newly = (new_keep > keep)[:, None, :, None]                                       # (B, 1, L, 1)
-        committed = torch.where(newly, view, committed)
+        newly = (new_keep > keep)                                                           # (B, L)
+        committed = torch.where(newly[:, None, :, None], view, committed)
+        c_committed = torch.where(newly[:, None, None, :], codes, c_committed)
         keep = new_keep
         t = int(commit_timestep(f)[0])
-        kw = sampling_kwargs if (k == len(schedule) and sampling_kwargs is not None) else greedy
+        kw = sampling_kwargs if ((hard or k == len(schedule)) and sampling_kwargs is not None) else greedy
         x, aux = reconstruct_far(model, tokenizer, masked_image, sample_mask, sampling_kwargs=kw, timestep_offset=t,
                                  draft_latent=committed, draft_keep=keep, **kwargs)
-        passes.append({"main": x, "main_no_dc": aux.get("decoded_no_dc"), "alt": aux.get("alt_rec"), "alt_no_dc": aux.get("alt_no_dc"),
-                       "keep": keep.clone(), "timestep": t})
+        codes = aux["codes"].long()
+        rec = {"main": x, "main_no_dc": aux.get("decoded_no_dc"), "alt": aux.get("alt_rec"), "alt_no_dc": aux.get("alt_no_dc"),
+               "keep": keep.clone(), "timestep": t}
+        if hard:   # the image of the committed codes plus this pass's codes elsewhere (the committed ones are not re-decided)
+            c_final = torch.where(keep.bool()[:, None, None, :], c_committed, codes)
+            img = torch.stack([decode_codes_image(tokenizer, c_final[:, s]) for s in range(2)], dim=-1)      # (B, H, W, 2)
+            rec["codes"] = c_final
+            rec["main_no_dc"] = img
+            rec["main"] = dc_fn(img, sample_mask) if dc_fn is not None else data_consistency(masked_image, img, sample_mask)
+            x = rec["main"] if kwargs.get("rec_mode", "tokens") != "latent" else x
+        passes.append(rec)
         view_k, conf_k = expected_embedding_view(aux["logits_1d"], codebook)
+        if hard:
+            view_k = codes_to_view(codes, codebook)
         view = torch.where(keep.bool()[:, None, :, None], committed, view_k)
         conf = torch.where(keep.bool(), torch.full_like(conf_k, float("inf")), conf_k)
     aux["commit_passes"] = passes
     aux["refine_pass1"] = pass1
+    if hard:
+        aux["commit_codes"] = passes[-1]["codes"]
+        aux["decoded_no_dc"] = passes[-1]["main_no_dc"] if kwargs.get("rec_mode", "tokens") != "latent" else aux.get("decoded_no_dc")
     return x, aux
+
+
+def decode_codes_image(tokenizer, codes_bkl: torch.Tensor) -> torch.Tensor:
+    """(B, K, L) codes of one stream -> (B, H, W) grayscale image in [-1, 1] (RGB-averaged decoder output)."""
+    f = tokenizer.post_quant_proj(tokenizer.quantizer.idx_to_f(codes_bkl))
+    return tokenizer.decoder(f).clamp(-1, 1).float().mean(1)
 
 
 @torch.no_grad()

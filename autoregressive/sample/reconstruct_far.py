@@ -765,6 +765,7 @@ def validate(
             rec_mode=getattr(args, 'rec_mode', 'tokens'),
             commit_schedule=getattr(args, 'commit_schedule', None),
             commit_mode=getattr(args, 'commit_mode', 'conf'),
+            commit_view=getattr(args, 'commit_view', 'expected'),
             **ps_kwargs,
         )  # [B,H,W,2]
         if rec_c_img.shape[1] != gt_c_image.shape[1]:   # back to the acquisition grid for metrics
