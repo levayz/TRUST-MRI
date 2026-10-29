@@ -499,6 +499,7 @@ def main(args):
         if args.dataset == 'sense':
             val_args.sens_dirs = args.val_sens_dirs or args.sens_dirs
             val_args.return_oracle_maps = (args.sens_maps == 'oracle')
+            val_args.gt_cache_dir = None   # the ground-truth cache is for the training set; validation scores images
         
         # Build validation dataset
         val_dataset = build_dataset(val_args)

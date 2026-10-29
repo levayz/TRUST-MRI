@@ -109,9 +109,10 @@ Components tried and dropped (each from the best model at the time; difference t
 | latent head with a residual MLP on the hidden state | 31.32 one pass | 31.27 | +0.05 (noise) |
 | fused latent head reading the token head's committed codes | 31.31 one pass | 31.27 | +0.04 (noise) |
 | privileged-teacher distillation (EMA teacher at x2-x4; KL on the token distribution and L2 on the latent, 3 epochs; plain DC) | 31.40 one pass / 31.33 mean of 8 | 31.35 / 31.29 | +0.05 (noise; the same as 3 more epochs without the teacher) |
+| progressive commitment (pass 2 and 3 re-predict the positions not committed after pass 1; commitment = expected embedding at the most confident positions by the latent spread; 2 epochs; plain DC) | 31.39 one pass after the commit passes | 31.38 pass 1 of the same model, 31.35 run11 | 0; the draft gate decayed to 0.19: the committed view is the model's own belief and adds no evidence |
 | sensitivity net instead of oracle maps (the whole pipeline) | within 0.1 of oracle maps | | 0 |
 
-Decoding-side findings of Oct 26 (no training): the plain acquisition-grid DC (+0.08 dB and -0.025 LPIPS on the latent path at 256) and the hybrid decoding (section 1). Running: the longer schedule (10 epochs at LR 1e-4) on row 5's model at 256 (run19) and on the 320-grid model (run18).
+Decoding-side findings of Oct 26 (no training): the plain acquisition-grid DC (+0.08 dB and -0.025 LPIPS on the latent path at 256) and the hybrid decoding (section 1). Running: the longer schedule (10 epochs at LR 1e-4) on row 5's model at 256 (run19); the same at 320 (run18) is done, see section 2a.
 
 ## 4. What was done this week
 
