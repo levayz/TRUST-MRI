@@ -35,3 +35,13 @@ checkpoints/
 *.pdf
 ISF_grant/
 .ipynb_checkpoints/
+
+# autoresearch (agent loop outputs)
+autoresearch/runs/
+autoresearch/results.tsv
+autoresearch/run.log
+autoresearch/calib*/
+
+# git worktrees of autoresearch campaigns
+.worktrees/
+.gpu_release_*
