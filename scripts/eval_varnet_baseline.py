@@ -27,6 +27,8 @@ from fastmri.models import VarNet
 _spec = importlib.util.spec_from_file_location("trust_subsample", "/fast/lev/TRUST-MRI/dataset/data/subsample.py")
 _sub = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_sub)
 create_mask_for_mask_type = _sub.create_mask_for_mask_type
+_fv_spec = importlib.util.spec_from_file_location("trust_feature_varnet", str(pathlib.Path(__file__).resolve().parent.parent / "models" / "feature_varnet.py"))
+_fv = importlib.util.module_from_spec(_fv_spec); _fv_spec.loader.exec_module(_fv)   # Feature VarNet (self-contained, no fastmri import)
 
 
 def fft2c(x):
@@ -57,6 +59,9 @@ def combine(coils, maps):
 
 def load_varnet(path, device):
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(ck, dict) and "model_config" in ck:               # Feature VarNet from train_varnet256.py --model feature_varnet
+        model, info = _fv.load_feature_varnet(path, device)
+        return model, dict(info, model="feature_varnet")
     if isinstance(ck, dict) and "hyper_parameters" in ck:           # Lightning checkpoint (fastmri_examples/varnet)
         hp = ck["hyper_parameters"]
         sd = {k[len("varnet."):]: v for k, v in ck["state_dict"].items() if k.startswith("varnet.")}
@@ -74,10 +79,14 @@ def load_varnet(path, device):
 
 
 @torch.no_grad()
-def varnet_kspace(model, k_masked, mask_cols, nlf):
+def varnet_kspace(model, k_masked, mask_cols, nlf, scale=None):
     """k_masked (B,C,H,W) complex, mask_cols (W,) bool -> predicted per-coil k-space (B,C,H,W) complex."""
     kr = torch.view_as_real(k_masked).float()
     mask5 = mask_cols.view(1, 1, 1, -1, 1).expand(kr.shape[0], 1, 1, -1, 1).contiguous()
+    if isinstance(model, _fv.FeatureVarNetK):   # batch-1 network; scale = max|x0| per slice, as in training (train_varnet256.py)
+        assert scale is not None, "Feature VarNet needs the per-slice max|x0| normalisation"
+        out = [model(kr[b:b + 1] / scale[b], mask5[b:b + 1], nlf) * scale[b] for b in range(kr.shape[0])]
+        return torch.view_as_complex(torch.cat(out, 0).contiguous())
     sens = model.sens_net(kr, mask5, nlf)
     kp = kr.clone()
     for cascade in model.cascades:
@@ -148,13 +157,14 @@ def main():
             res["rss_ref"].append((coils256.abs() ** 2).sum(1).sqrt().cpu().numpy())
             res["x0_ref"].append(x0.abs().cpu().numpy()); res["support"].append(support.cpu().numpy())
             if "native" in args.grids:
+                assert not isinstance(model, _fv.FeatureVarNetK), "Feature VarNet is trained on the 256 grid only: use --grids grid256"
                 kp = varnet_kspace(model, k * m_nat, m_nat, int(nlf_nat))
                 pc = crop(crop(ifft2c(kp), mp.shape[-2:]), (cs, cs))
                 res["native_rss"].append((pc.abs() ** 2).sum(1).sqrt().cpu().numpy())
                 res["native_sense"].append(combine(pc, maps256)[0].abs().cpu().numpy())
             if "grid256" in args.grids:
                 k256 = fft2c(coils256) * m_256
-                kp = varnet_kspace(model, k256, m_256, int(nlf_256))
+                kp = varnet_kspace(model, k256, m_256, int(nlf_256), scale=x0.abs().flatten(1).amax(1).clamp_min(1e-12))
                 pc = ifft2c(kp)
                 res["grid256_rss"].append((pc.abs() ** 2).sum(1).sqrt().cpu().numpy())
                 res["grid256_sense"].append(combine(pc, maps256)[0].abs().cpu().numpy())

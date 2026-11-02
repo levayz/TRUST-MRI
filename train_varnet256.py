@@ -34,6 +34,7 @@ from dataset.data.subsample import create_mask_for_mask_type                    
 from dataset.sense_data import SenseSliceDataset                                 # noqa: E402
 from models.sense_ops import acs_num_low_freqs, c2r, fft2c, ifft2c, mask_bhw, mask_for_sens_net, r2c, sense_combine  # noqa: E402
 from models.varnet_sens import VarNet, load_varnet                               # noqa: E402
+from models.feature_varnet import FEATURE_VARNET_VARIANTS, FeatureVarNetK         # noqa: E402
 from utils.logger import create_logger, log_args                                 # noqa: E402
 
 
@@ -53,6 +54,12 @@ def parse_args():
     p.add_argument("--mask-type", default="cart_1d", choices=["cart_1d", "random", "equispaced"])
     p.add_argument("--num-samples", type=int, default=None)
     p.add_argument("--init-ckpt", default="weights/varnet/brain_leaderboard_state_dict.pt", help="VarNet weights to start from; 'none' = scratch")
+    p.add_argument("--model", default="e2e", choices=["e2e", "feature_varnet"],
+                   help="e2e = E2E-VarNet (models/varnet_sens.py); feature_varnet = Giannakopoulos et al. 2024 (models/feature_varnet.py), "
+                        "trained from scratch (no released weights) with --init-ckpt ignored")
+    p.add_argument("--fv-variant", default="fi_varnet", choices=list(FEATURE_VARNET_VARIANTS))
+    p.add_argument("--kspace-mult-factor", type=float, default=1.0, help="feature_varnet: 1.0 for our max|x0|-normalised slices (official 1e6 is for raw k-space)")
+    p.add_argument("--optimizer", default="adam", choices=["adam", "adamw"])
     p.add_argument("--num-cascades", type=int, default=12)
     p.add_argument("--chans", type=int, default=18)
     p.add_argument("--sens-chans", type=int, default=8)
@@ -81,7 +88,10 @@ def run_varnet(model, coils_r, mask, num_coils, nlf):
     H = coils.shape[-2]
     k_us = fft2c(coils) * mask_bhw(mask, H)[:, None]
     mask5 = mask_for_sens_net(mask).bool()
-    kp = model(c2r(k_us), mask5, num_low_frequencies=nlf, num_coils=num_coils)
+    if isinstance(model, FeatureVarNetK):
+        kp = model.forward_padded(c2r(k_us), mask5, num_low_frequencies=nlf, num_coils=num_coils)
+    else:
+        kp = model(c2r(k_us), mask5, num_low_frequencies=nlf, num_coils=num_coils)
     return k_us, kp
 
 
@@ -148,16 +158,22 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.val_batch_size, shuffle=False, num_workers=min(4, args.num_workers), pin_memory=True)
     logger.info(f"train: {len(train_ds)} slices, val: {len(val_ds)} slices; ACS width {nlf}")
 
-    if args.init_ckpt and args.init_ckpt.lower() != "none":
+    if args.model == "feature_varnet":
+        model = FeatureVarNetK(variant=args.fv_variant, num_cascades=args.num_cascades, chans=args.chans, sens_chans=args.sens_chans,
+                               acceleration=args.accelerations, kspace_mult_factor=args.kspace_mult_factor).to(device)
+        logger.info(f"Feature VarNet ({args.fv_variant}) initialised from scratch: {model.config}")
+    elif args.init_ckpt and args.init_ckpt.lower() != "none":
         model = load_varnet(args.init_ckpt, device=device, trainable=True)
         logger.info(f"initialised from {args.init_ckpt}")
     else:
         model = VarNet(num_cascades=args.num_cascades, sens_chans=args.sens_chans, chans=args.chans).to(device)
         logger.info("initialised from scratch")
     model.train()
-    logger.info(f"VarNet: {len(model.cascades)} cascades, {sum(p.numel() for p in model.parameters()):,} params")
+    logger.info(f"{type(model).__name__}: {args.num_cascades if args.model == 'feature_varnet' else len(model.cascades)} cascades, "
+                f"{sum(p.numel() for p in model.parameters()):,} params")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt_cls = torch.optim.AdamW if args.optimizer == "adamw" else torch.optim.Adam
+    optimizer = opt_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = len(train_loader)
     total_steps = args.epochs * steps_per_epoch if args.max_steps <= 0 else min(args.max_steps, args.epochs * steps_per_epoch)
     warmup = max(1, int(args.warmup_frac * total_steps))
@@ -179,6 +195,8 @@ def main():
 
     def save(path, epoch, val=None, with_optim=False):
         ck = {"state_dict": model.state_dict(), "args": vars(args), "epoch": epoch, "step": step, "val": val, "best_psnr": best_psnr, "history": history}
+        if isinstance(model, FeatureVarNetK):
+            ck["model_config"] = model.config
         if with_optim:
             ck["optimizer"] = optimizer.state_dict(); ck["scheduler"] = scheduler.state_dict()
         torch.save(ck, path)
