@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Feature VarNet baseline end to end: wait until the target GPU is free (< 2 GB used), train on our training set
+# Feature VarNet baseline end to end: wait until the target GPU is free (autoresearch/gpu_wait.sh), train on our training set
 # (train_feature_varnet256.sh), then reconstruct the suno split on the 256 grid with best.pt and score it (both references).
 # Detach it:  GPU=4 RUN=run1 setsid nohup bash run_feature_varnet_pipeline.sh > /dev/null 2>&1 &
 # Progress: $RES/feature_varnet256/$RUN/pipeline.log; scores: results/sense_block/suno_acc8_featvarnet256_$RUN/summary.json
@@ -10,8 +10,9 @@ RES=${RES:-/fast/lev/TRUST-MRI/results}   # outputs go to the main checkout (res
 R=$RES/feature_varnet256/$RUN; TAG=suno_acc8_featvarnet256_$RUN
 mkdir -p "$R"; LOG=$R/pipeline.log
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
-log "waiting for GPU $GPU to be free (< 2 GB used)"
-until [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU")" -lt 2000 ]; do sleep 120; done
+log "waiting for GPU $GPU (autoresearch/gpu_wait.sh: asks gpu_hold.py to release it, then < 2 GB used by anything but the holder)"
+# a plain nvidia-smi memory check never passes: our holder grabs the freed memory within seconds
+AR_WAIT_MINUTES=${WAIT_MINUTES:-4320} bash autoresearch/gpu_wait.sh "$GPU" >> "$LOG" 2>&1 || { log "GPU $GPU not free after the wait: giving up"; exit 3; }
 log "GPU $GPU free; training $R"
 CUDA_VISIBLE_DEVICES=$GPU RUN=$RUN OUT=$R bash train_feature_varnet256.sh > /dev/null 2>&1
 log "training exit $?; $(grep -h 'done. best' "$R/stdout.log" | tail -1)"
