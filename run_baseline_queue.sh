@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CVPR baseline queue (Nov 3 2026), all on one GPU, after the Feature VarNet x8 pipeline (results/feature_varnet256/run1) has scored:
-#   A  E2E-VarNet x8, re-selected: leaderboard init, 4 epochs, model selection on val_nosuno15 (run1 selected on suno = test)
-#   B  E2E-VarNet x16: init from A's best.pt, 4 epochs
+#   A  (optional, RESELECT_E2E=1) E2E-VarNet x8, re-selected: leaderboard init, 4 epochs, model selection on val_nosuno15 (run1 selected on suno = test)
+#   B  E2E-VarNet x16: init from the E2E x8 run1 best.pt (or A's), 4 epochs
 #   C  Feature VarNet x16: init from the Feature VarNet x8 best_final.pt, 2 epochs, AdamW lr 1e-4
 # Every model: random 1D masks, cf 0.04 (10 ACS lines at 256), selection on results/feature_varnet/val_nosuno15.txt (disjoint
 # from suno and from the training list), then one suno reconstruction at its training acceleration + scoring (both references).
@@ -49,13 +49,19 @@ log "queue start: waiting for the Feature VarNet x8 pipeline to score"
 until grep -qE "score exit|giving up" "$RES/feature_varnet256/run1/pipeline.log"; do sleep 300; done
 log "Feature VarNet x8 done"
 
-A=$RES/varnet256/run2_valnosuno
-train "$A" --model e2e --init-ckpt weights/varnet/brain_leaderboard_state_dict.pt --accelerations 8 --epochs 4 --batch-size 4 --lr 1e-4
-evaluate "$A/best_final.pt" 8 suno_acc8_varnet256_run2_valnosuno
+# A is off by default (Nov 3: selecting on suno is accepted for the paper, so E2E x8 run1 stands); RESELECT_E2E=1 turns it on.
+if [ "${RESELECT_E2E:-0}" = 1 ]; then
+  A=$RES/varnet256/run2_valnosuno; E2E_X8=$A/best_final.pt
+  train "$A" --model e2e --init-ckpt weights/varnet/brain_leaderboard_state_dict.pt --accelerations 8 --epochs 4 --batch-size 4 --lr 1e-4
+  evaluate "$E2E_X8" 8 suno_acc8_varnet256_run2_valnosuno
+else
+  E2E_X8=$RES/varnet256/run1/best.pt
+  log "E2E x8 re-selection skipped; E2E x16 starts from $E2E_X8"
+fi
 
 B=$RES/varnet256_x16/run1
-if [ -f "$A/best_final.pt" ]; then
-  train "$B" --model e2e --init-ckpt "$A/best_final.pt" --accelerations 16 --epochs 4 --batch-size 4 --lr 1e-4
+if [ -f "$E2E_X8" ]; then
+  train "$B" --model e2e --init-ckpt "$E2E_X8" --accelerations 16 --epochs 4 --batch-size 4 --lr 1e-4
   evaluate "$B/best_final.pt" 16 suno_acc16_varnet256_x16_run1
 else
   log "no E2E x8 checkpoint: skipping E2E x16"
