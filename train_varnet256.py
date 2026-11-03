@@ -58,6 +58,8 @@ def parse_args():
                    help="e2e = E2E-VarNet (models/varnet_sens.py); feature_varnet = Giannakopoulos et al. 2024 (models/feature_varnet.py), "
                         "trained from scratch (no released weights) with --init-ckpt ignored")
     p.add_argument("--fv-variant", default="fi_varnet", choices=list(FEATURE_VARNET_VARIANTS))
+    p.add_argument("--fv-init-ckpt", default="none", help="feature_varnet: warm start from a checkpoint of this script (e.g. the x8 best.pt "
+                   "for the x16 model); the architecture comes from its model_config, the attention block size from --accelerations")
     p.add_argument("--kspace-mult-factor", type=float, default=1.0, help="feature_varnet: 1.0 for our max|x0|-normalised slices (official 1e6 is for raw k-space)")
     p.add_argument("--optimizer", default="adam", choices=["adam", "adamw"])
     p.add_argument("--num-cascades", type=int, default=12)
@@ -159,9 +161,17 @@ def main():
     logger.info(f"train: {len(train_ds)} slices, val: {len(val_ds)} slices; ACS width {nlf}")
 
     if args.model == "feature_varnet":
-        model = FeatureVarNetK(variant=args.fv_variant, num_cascades=args.num_cascades, chans=args.chans, sens_chans=args.sens_chans,
-                               acceleration=args.accelerations, kspace_mult_factor=args.kspace_mult_factor).to(device)
-        logger.info(f"Feature VarNet ({args.fv_variant}) initialised from scratch: {model.config}")
+        if args.fv_init_ckpt and args.fv_init_ckpt.lower() != "none":
+            ck = torch.load(args.fv_init_ckpt, map_location="cpu", weights_only=False)
+            cfg = dict(ck["model_config"], acceleration=args.accelerations)   # AttentionPE block size has no weights
+            model = FeatureVarNetK(**cfg)
+            model.load_state_dict(ck["state_dict"], strict=True)
+            model = model.to(device)
+            logger.info(f"Feature VarNet initialised from {args.fv_init_ckpt} (epoch {ck.get('epoch')}): {model.config}")
+        else:
+            model = FeatureVarNetK(variant=args.fv_variant, num_cascades=args.num_cascades, chans=args.chans, sens_chans=args.sens_chans,
+                                   acceleration=args.accelerations, kspace_mult_factor=args.kspace_mult_factor).to(device)
+            logger.info(f"Feature VarNet ({args.fv_variant}) initialised from scratch: {model.config}")
     elif args.init_ckpt and args.init_ckpt.lower() != "none":
         model = load_varnet(args.init_ckpt, device=device, trainable=True)
         logger.info(f"initialised from {args.init_ckpt}")
